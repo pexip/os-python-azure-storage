@@ -1,0 +1,4 @@
+azure-nspkg
+azure-common
+python-dateutil
+requests
