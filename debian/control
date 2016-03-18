@@ -1,0 +1,13 @@
+Source: python-azure-storage
+Section: python
+Priority: optional
+Maintainer: Pexip AS <packaging@pexip.com>
+Build-Depends: debhelper (>= 8.0.0), dh-python,
+ python-all (>= 2.7), python-setuptools
+Standards-Version: 3.9.2
+Homepage: https://github.com/Azure/azure-storage-python
+
+Package: python-azure-storage
+Architecture: all
+Depends: ${python:Depends} ${misc:Depends}
+Description: Microsoft Azure Storage Client Library for Python

@@ -1,0 +1,5 @@
+python-azure-storage (0.30.0-1) pexip; urgency=low
+
+  * Initial release
+
+ -- John-Mark Bell <jmb@pexip.com>  Fri, 18 Mar 2016 19:24:12 +0000
