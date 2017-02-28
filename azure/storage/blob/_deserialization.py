@@ -13,6 +13,7 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 from dateutil import parser
+from azure.storage._error import AzureException
 try:
     from xml.etree import cElementTree as ETree
 except ImportError:
@@ -25,8 +26,8 @@ from .._deserialization import (
     _parse_properties,
     _int_to_str,
     _parse_metadata,
-    _parse_response_for_dict,
     _convert_xml_to_signed_identifiers,
+    _bool,
 )
 from .models import (
     Container,
@@ -42,17 +43,21 @@ from .models import (
     ResourceProperties,
     BlobPrefix,
 )
+from ._encryption import _decrypt_blob
 from ..models import _list
+from .._error import(
+    _validate_content_match,
+    _ERROR_DECRYPTION_FAILURE,
+)
+from .._common_conversion import _get_content_md5
 
 def _parse_base_properties(response):
     '''
     Extracts basic response headers.
     '''   
-    raw_headers = _parse_response_for_dict(response)
-
     resource_properties = ResourceProperties()
-    resource_properties.last_modified = parser.parse(raw_headers.get('last-modified'))
-    resource_properties.etag = raw_headers.get('etag')
+    resource_properties.last_modified = parser.parse(response.headers.get('last-modified'))
+    resource_properties.etag = response.headers.get('etag')
 
     return resource_properties
 
@@ -60,12 +65,10 @@ def _parse_page_properties(response):
     '''
     Extracts page response headers.
     '''   
-    raw_headers = _parse_response_for_dict(response)
-
     put_page = PageBlobProperties()
-    put_page.last_modified = parser.parse(raw_headers.get('last-modified'))
-    put_page.etag = raw_headers.get('etag')
-    put_page.sequence_number = _int_to_str(raw_headers.get('x-ms-blob-sequence-number'))
+    put_page.last_modified = parser.parse(response.headers.get('last-modified'))
+    put_page.etag = response.headers.get('etag')
+    put_page.sequence_number = _int_to_str(response.headers.get('x-ms-blob-sequence-number'))
 
     return put_page
 
@@ -73,54 +76,65 @@ def _parse_append_block(response):
     '''
     Extracts append block response headers.
     '''   
-    raw_headers = _parse_response_for_dict(response)
-
     append_block = AppendBlockProperties()
-    append_block.last_modified = parser.parse(raw_headers.get('last-modified'))
-    append_block.etag = raw_headers.get('etag')
-    append_block.append_offset = _int_to_str(raw_headers.get('x-ms-blob-append-offset'))
-    append_block.committed_block_count = _int_to_str(raw_headers.get('x-ms-blob-committed-block-count'))
+    append_block.last_modified = parser.parse(response.headers.get('last-modified'))
+    append_block.etag = response.headers.get('etag')
+    append_block.append_offset = _int_to_str(response.headers.get('x-ms-blob-append-offset'))
+    append_block.committed_block_count = _int_to_str(response.headers.get('x-ms-blob-committed-block-count'))
 
     return append_block
 
-def _parse_snapshot_blob(name, response):
+def _parse_snapshot_blob(response, name):
     '''
     Extracts snapshot return header.
     '''   
-    raw_headers = _parse_response_for_dict(response)
-    snapshot = raw_headers.get('x-ms-snapshot')
+    snapshot = response.headers.get('x-ms-snapshot')
 
-    return _parse_blob(name, snapshot, response)
+    return _parse_blob(response, name, snapshot)
 
-def _parse_lease_time(response):
+def _parse_lease(response):
     '''
-    Extracts lease time return header.
-    '''   
-    raw_headers = _parse_response_for_dict(response)
-    lease_time = raw_headers.get('x-ms-lease-time')
-    if lease_time:
-        lease_time = _int_to_str(lease_time)
-
-    return lease_time
-
-def _parse_lease_id(response):
+    Extracts lease time and ID return headers.
     '''
-    Extracts lease ID return header.
-    '''   
-    raw_headers = _parse_response_for_dict(response)
-    lease_id = raw_headers.get('x-ms-lease-id')
+    lease = {}
+    lease['time'] = response.headers.get('x-ms-lease-time')
+    if lease['time']:
+        lease['time'] = _int_to_str(lease['time'])
 
-    return lease_id
+    lease['id'] = response.headers.get('x-ms-lease-id')
 
-def _parse_blob(name, snapshot, response):
+    return lease
+
+def _parse_blob(response, name, snapshot, validate_content=False, require_encryption=False,
+                key_encryption_key=None, key_resolver_function=None, start_offset=None, end_offset=None):
     if response is None:
         return None
 
     metadata = _parse_metadata(response)
     props = _parse_properties(response, BlobProperties)
+
+    # For range gets, only look at 'x-ms-blob-content-md5' for overall MD5
+    content_settings = getattr(props, 'content_settings')
+    if 'content-range' in response.headers:
+        if 'x-ms-blob-content-md5' in response.headers:
+            setattr(content_settings, 'content_md5', _to_str(response.headers['x-ms-blob-content-md5']))
+        else:
+            delattr(content_settings, 'content_md5')
+
+    if validate_content:
+        computed_md5 = _get_content_md5(response.body)
+        _validate_content_match(response.headers['content-md5'], computed_md5)
+
+    if key_encryption_key is not None or key_resolver_function is not None:
+            try:
+                response.body = _decrypt_blob(require_encryption, key_encryption_key, key_resolver_function,
+                                              response, start_offset, end_offset)
+            except:
+                raise AzureException(_ERROR_DECRYPTION_FAILURE)
+
     return Blob(name, snapshot, response.body, props, metadata)
 
-def _parse_container(name, response):
+def _parse_container(response, name):
     if response is None:
         return None
 
@@ -129,10 +143,8 @@ def _parse_container(name, response):
     return Container(name, props, metadata)
 
 def _convert_xml_to_signed_identifiers_and_access(response):
-    acl = _convert_xml_to_signed_identifiers(response.body)
-
-    raw_headers = _parse_response_for_dict(response)
-    acl.public_access = raw_headers.get('x-ms-blob-public-access')
+    acl = _convert_xml_to_signed_identifiers(response)
+    acl.public_access = response.headers.get('x-ms-blob-public-access')
 
     return acl
 
@@ -151,7 +163,8 @@ def _convert_xml_to_containers(response):
             <Etag>etag</Etag>
             <LeaseStatus>locked | unlocked</LeaseStatus>
             <LeaseState>available | leased | expired | breaking | broken</LeaseState>
-            <LeaseDuration>infinite | fixed</LeaseDuration>      
+            <LeaseDuration>infinite | fixed</LeaseDuration>
+            <PublicAccess>blob | container</PublicAccess>
           </Properties>
           <Metadata>
             <metadata-name>value</metadata-name>
@@ -162,7 +175,7 @@ def _convert_xml_to_containers(response):
     </EnumerationResults>
     '''
     if response is None or response.body is None:
-        return response
+        return None
 
     containers = _list()
     list_element = ETree.fromstring(response.body)
@@ -191,6 +204,7 @@ def _convert_xml_to_containers(response):
         container.properties.lease_status = properties_element.findtext('LeaseStatus')
         container.properties.lease_state = properties_element.findtext('LeaseState')
         container.properties.lease_duration = properties_element.findtext('LeaseDuration')
+        container.properties.public_access = properties_element.findtext('PublicAccess')
         
         # Add container to list
         containers.append(container)
@@ -203,6 +217,7 @@ LIST_BLOBS_ATTRIBUTE_MAP = {
     'x-ms-blob-sequence-number': (None, 'sequence_number', _int_to_str),
     'BlobType': (None, 'blob_type', _to_str),
     'Content-Length': (None, 'content_length', _int_to_str),
+    'ServerEncrypted': (None, 'server_encrypted', _bool),
     'Content-Type': ('content_settings', 'content_type', _to_str),
     'Content-Encoding': ('content_settings', 'content_encoding', _to_str),
     'Content-Disposition': ('content_settings', 'content_disposition', _to_str),
@@ -265,7 +280,7 @@ def _convert_xml_to_blob_list(response):
     </EnumerationResults>
     '''
     if response is None or response.body is None:
-        return response
+        return None
 
     blob_list = _list()    
     list_element = ETree.fromstring(response.body)
@@ -332,27 +347,29 @@ def _convert_xml_to_block_list(response):
     Converts xml response to block list class.
     '''
     if response is None or response.body is None:
-        return response
+        return None
 
     block_list = BlobBlockList()
 
     list_element = ETree.fromstring(response.body)
 
     committed_blocks_element = list_element.find('CommittedBlocks')
-    for block_element in committed_blocks_element.findall('Block'):
-        block_id = _decode_base64_to_text(block_element.findtext('Name', ''))
-        block_size = int(block_element.findtext('Size'))
-        block = BlobBlock(id=block_id, state=BlobBlockState.Committed)
-        block._set_size(block_size)
-        block_list.committed_blocks.append(block)
+    if committed_blocks_element is not None:
+        for block_element in committed_blocks_element.findall('Block'):
+            block_id = _decode_base64_to_text(block_element.findtext('Name', ''))
+            block_size = int(block_element.findtext('Size'))
+            block = BlobBlock(id=block_id, state=BlobBlockState.Committed)
+            block._set_size(block_size)
+            block_list.committed_blocks.append(block)
 
     uncommitted_blocks_element = list_element.find('UncommittedBlocks')
-    for block_element in uncommitted_blocks_element.findall('Block'):
-        block_id = _decode_base64_to_text(block_element.findtext('Name', ''))
-        block_size = int(block_element.findtext('Size'))
-        block = BlobBlock(id=block_id, state=BlobBlockState.Uncommitted)
-        block._set_size(block_size)
-        block_list.uncommitted_blocks.append(block)
+    if uncommitted_blocks_element is not None:
+        for block_element in uncommitted_blocks_element.findall('Block'):
+            block_id = _decode_base64_to_text(block_element.findtext('Name', ''))
+            block_size = int(block_element.findtext('Size'))
+            block = BlobBlock(id=block_id, state=BlobBlockState.Uncommitted)
+            block._set_size(block_size)
+            block_list.uncommitted_blocks.append(block)
 
     return block_list
 
@@ -360,29 +377,40 @@ def _convert_xml_to_page_ranges(response):
     '''
     <?xml version="1.0" encoding="utf-8"?>
     <PageList>
-       <PageRange>
-          <Start>Start Byte</Start>
-          <End>End Byte</End>
-       </PageRange>
-       <PageRange>
-          <Start>Start Byte</Start>
-          <End>End Byte</End>
-       </PageRange>
-    </PageList>
+       <PageRange> 
+          <Start>Start Byte</Start> 
+          <End>End Byte</End> 
+       </PageRange> 
+       <ClearRange> 
+          <Start>Start Byte</Start> 
+          <End>End Byte</End> 
+       </ClearRange> 
+       <PageRange> 
+          <Start>Start Byte</Start> 
+          <End>End Byte</End> 
+       </PageRange> 
+    </PageList> 
     '''
     if response is None or response.body is None:
-        return response
+        return None
 
     page_list = list()
 
     list_element = ETree.fromstring(response.body)
 
-    page_range_elements = list_element.findall('PageRange')
-    for page_range_element in page_range_elements:
+    for page_range_element in list_element:
+        if page_range_element.tag == 'PageRange':
+            is_cleared = False
+        elif page_range_element.tag == 'ClearRange':
+            is_cleared = True
+        else:
+            pass # ignore any unrecognized Page Range types
+
         page_list.append(
             PageRange(
                 int(page_range_element.findtext('Start')),
-                int(page_range_element.findtext('End'))
+                int(page_range_element.findtext('End')),
+                is_cleared
             )
         )
 

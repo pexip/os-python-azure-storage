@@ -63,8 +63,8 @@ def _update_storage_table_header(request):
     ''' add additional headers for storage table request. '''
 
     # set service version
-    request.headers.append(('DataServiceVersion', '3.0;NetFx'))
-    request.headers.append(('MaxDataServiceVersion', '3.0'))
+    request.headers['DataServiceVersion'] = '3.0;NetFx'
+    request.headers['MaxDataServiceVersion'] = '3.0'
 
 def _to_entity_binary(value):
    return EdmType.BINARY, _encode_base64(value)
@@ -92,7 +92,7 @@ def _to_entity_int32(value):
         value = long(value)
     else:
         value = int(value)
-    if value >= 2**15 or value < -(2**15):
+    if value >= 2**31 or value < -(2**31):
         raise TypeError(_ERROR_VALUE_TOO_LARGE.format(str(value), EdmType.INT32))       
     return None, value
 
@@ -101,7 +101,7 @@ def _to_entity_int64(value):
         ivalue = long(value)
     else:
         ivalue = int(value)
-    if ivalue >= 2**31 or ivalue < -(2**31):
+    if ivalue >= 2**63 or ivalue < -(2**63):
         raise TypeError(_ERROR_VALUE_TOO_LARGE.format(str(value), EdmType.INT64))       
     return EdmType.INT64, str(value)
 
@@ -227,15 +227,14 @@ def _convert_batch_to_json(batch_requests):
         body.append(b'Content-Type: application/http\n')
         body.append(b'Content-Transfer-Encoding: binary\n\n')
         body.append(request.method.encode('utf-8'))
-        body.append(b' http://')
-        body.append(request.host.encode('utf-8'))
+        body.append(b' ')
         body.append(request.path.encode('utf-8'))
         body.append(b' HTTP/1.1\n')
         body.append(b'Content-ID: ')
         body.append(str(content_id).encode('utf-8') + b'\n')
         content_id += 1
 
-        for name, value in request.headers:
+        for name, value in request.headers.items():
             if name in _SUB_HEADERS:
                 body.append(name.encode('utf-8') + b': ')
                 body.append(value.encode('utf-8') + b'\n')

@@ -18,11 +18,15 @@ import hashlib
 import hmac
 import sys
 from dateutil.tz import tzutc
+from io import (IOBase, SEEK_SET)
 
+from ._error import (
+    _ERROR_VALUE_SHOULD_BE_BYTES_OR_STREAM,
+    _ERROR_VALUE_SHOULD_BE_SEEKABLE_STREAM,
+)
 from .models import (
     _unicode_type,
 )
-
 
 if sys.version_info < (3,):
     def _str(value):
@@ -32,7 +36,6 @@ if sys.version_info < (3,):
         return str(value)
 else:
     _str = str
-
 
 def _to_str(value):
     return _str(value) if value is not None else None
@@ -98,6 +101,26 @@ def _sign_string(key, string_to_sign, key_is_base64=True):
     encoded_digest = _encode_base64(digest)
     return encoded_digest
 
+def _get_content_md5(data):
+    md5 = hashlib.md5()
+    if isinstance(data, bytes):
+        md5.update(data)
+    elif hasattr(data, 'read'):
+        pos = 0
+        try:
+            pos = data.tell()
+        except:
+            pass
+        for chunk in iter(lambda: data.read(4096), b""):
+            md5.update(chunk)
+        try:
+            data.seek(pos, SEEK_SET)
+        except (AttributeError, IOError):
+            raise ValueError(_ERROR_VALUE_SHOULD_BE_SEEKABLE_STREAM.format('data'))
+    else:
+        raise ValueError(_ERROR_VALUE_SHOULD_BE_BYTES_OR_STREAM.format('data'))
+
+    return base64.b64encode(md5.digest()).decode('utf-8')
 
 def _lower(text):
     return text.lower()

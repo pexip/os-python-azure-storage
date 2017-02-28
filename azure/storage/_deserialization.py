@@ -27,10 +27,15 @@ from .models import (
     AccessPolicy,
     _HeaderDict,
     _dict,
+    GeoReplication,
+    ServiceStats,
 )
 
 def _int_to_str(value):
     return value if value is None else int(value)
+
+def _bool(value):
+    return value.lower() == 'true'
 
 def _get_download_size(start_range, end_range, resource_size):
     if start_range is not None:
@@ -47,9 +52,11 @@ GET_PROPERTIES_ATTRIBUTE_MAP = {
     'etag': (None, 'etag', _to_str),
     'x-ms-blob-type': (None, 'blob_type', _to_str),
     'content-length': (None, 'content_length', _int_to_str),
+    'content-range': (None, 'content_range', _to_str),
     'x-ms-blob-sequence-number': (None, 'page_blob_sequence_number', _int_to_str),
     'x-ms-blob-committed-block-count': (None, 'append_blob_committed_block_count', _int_to_str),
     'x-ms-share-quota': (None, 'quota', _int_to_str),
+    'x-ms-server-encrypted': (None, 'server_encrypted', _bool),
     'content-type': ('content_settings', 'content_type', _to_str),
     'cache-control': ('content_settings', 'cache_control', _to_str),
     'content-encoding': ('content_settings', 'content_encoding', _to_str),
@@ -64,6 +71,7 @@ GET_PROPERTIES_ATTRIBUTE_MAP = {
     'x-ms-copy-status': ('copy', 'status', _to_str),
     'x-ms-copy-progress': ('copy', 'progress', _to_str),
     'x-ms-copy-completion-time': ('copy', 'completion_time', parser.parse),
+    'x-ms-copy-destination-snapshot': ('copy', 'destination_snapshot_time', _to_str),
     'x-ms-copy-status-description': ('copy', 'status_description', _to_str),
 }
 
@@ -76,7 +84,7 @@ def _parse_metadata(response):
         return None
 
     metadata = _dict()
-    for key, value in response.headers:
+    for key, value in response.headers.items():
         if key.startswith('x-ms-meta-'):
             metadata[key[10:]] = _to_str(value)
 
@@ -92,7 +100,7 @@ def _parse_properties(response, result_class):
         return None
 
     props = result_class()
-    for key, value in response.headers:
+    for key, value in response.headers.items():
         info = GET_PROPERTIES_ATTRIBUTE_MAP.get(key)
         if info:
             if info[0] is None:
@@ -103,24 +111,36 @@ def _parse_properties(response, result_class):
 
     return props
 
-def _parse_response_for_dict(response):
-    ''' Extracts name-values from response header. Filter out the standard
-    http headers.'''
-
-    if response is None:
+def _parse_length_from_content_range(content_range):
+    '''
+    Parses the blob length from the content range header: bytes 1-3/65537
+    '''   
+    if content_range is None:
         return None
-    http_headers = ['server', 'date', 'location', 'host',
-                    'via', 'proxy-connection', 'connection']
-    return_dict = _HeaderDict()
-    if response.headers:
-        for name, value in response.headers:
-            if not name.lower() in http_headers:
-                return_dict[name] = value
 
-    return return_dict
+    # First, split in space and take the second half: '1-3/65537'
+    # Next, split on slash and take the second half: '65537'
+    # Finally, convert to an int: 65537
+    return int(content_range.split(' ', 1)[1].split('/', 1)[1])
 
-def _convert_xml_to_signed_identifiers(xml):
-    list_element = ETree.fromstring(xml)
+def _convert_xml_to_signed_identifiers(response):
+    '''
+    <?xml version="1.0" encoding="utf-8"?>
+    <SignedIdentifiers>
+      <SignedIdentifier>
+        <Id>unique-value</Id>
+        <AccessPolicy>
+          <Start>start-time</Start>
+          <Expiry>expiry-time</Expiry>
+          <Permission>abbreviated-permission-list</Permission>
+        </AccessPolicy>
+      </SignedIdentifier>
+    </SignedIdentifiers>
+    '''
+    if response is None or response.body is None:
+        return None
+
+    list_element = ETree.fromstring(response.body)
     signed_identifiers = _dict()
 
     for signed_identifier_element in list_element.findall('SignedIdentifier'):
@@ -130,22 +150,47 @@ def _convert_xml_to_signed_identifiers(xml):
         # Access policy element
         access_policy = AccessPolicy()
         access_policy_element = signed_identifier_element.find('AccessPolicy')
+        if access_policy_element is not None:
+            start_element = access_policy_element.find('Start')
+            if start_element is not None:
+                access_policy.start = parser.parse(start_element.text)
 
-        start_element = access_policy_element.find('Start')
-        if start_element is not None:
-            access_policy.start = parser.parse(start_element.text)
+            expiry_element = access_policy_element.find('Expiry')
+            if expiry_element is not None:
+                access_policy.expiry = parser.parse(expiry_element.text)
 
-        expiry_element = access_policy_element.find('Expiry')
-        if expiry_element is not None:
-            access_policy.expiry = parser.parse(expiry_element.text)
-
-        access_policy.permission = access_policy_element.findtext('Permission')
+            access_policy.permission = access_policy_element.findtext('Permission')
 
         signed_identifiers[id] = access_policy
 
     return signed_identifiers
 
-def _convert_xml_to_service_properties(xml):
+def _convert_xml_to_service_stats(response):
+    '''
+    <?xml version="1.0" encoding="utf-8"?>
+    <StorageServiceStats>
+      <GeoReplication>      
+          <Status>live|bootstrap|unavailable</Status>
+          <LastSyncTime>sync-time|<empty></LastSyncTime>
+      </GeoReplication>
+    </StorageServiceStats>
+    '''
+    if response is None or response.body is None:
+        return None
+
+    service_stats_element = ETree.fromstring(response.body)
+
+    geo_replication_element = service_stats_element.find('GeoReplication')
+
+    geo_replication = GeoReplication()
+    geo_replication.status = geo_replication_element.find('Status').text
+    geo_replication.last_sync_time = parser.parse(geo_replication_element.find('LastSyncTime').text)
+
+    service_stats = ServiceStats()
+    service_stats.geo_replication = geo_replication
+    return service_stats
+
+def _convert_xml_to_service_properties(response):
     '''
     <?xml version="1.0" encoding="utf-8"?>
     <StorageServiceProperties>
@@ -188,7 +233,10 @@ def _convert_xml_to_service_properties(xml):
         </Cors>
     </StorageServiceProperties>
     '''
-    service_properties_element = ETree.fromstring(xml)
+    if response is None or response.body is None:
+        return None
+
+    service_properties_element = ETree.fromstring(response.body)
     service_properties = ServiceProperties()
     
     # Logging
@@ -282,7 +330,3 @@ def _convert_xml_to_retention_policy(xml, retention_policy):
     days_element =  xml.find('Days')
     if days_element is not None:
         retention_policy.days = int(days_element.text)
-
-
-def _bool(value):
-    return value.lower() == 'true'

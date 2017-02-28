@@ -13,11 +13,16 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 from azure.common import AzureHttpError
+from azure.storage._error import AzureException
 from .._error import (
     _dont_fail_not_exist,
     _dont_fail_on_exist,
     _validate_not_none,
-    _ERROR_PARALLEL_NOT_SEEKABLE
+    _validate_decryption_required,
+    _validate_access_policies,
+    _validate_content_match,
+    _ERROR_PARALLEL_NOT_SEEKABLE,
+    _ERROR_DECRYPTION_FAILURE,
 )
 from ._error import (
     _ERROR_INVALID_LEASE_DURATION,
@@ -27,18 +32,21 @@ from .._common_conversion import (
     _int_to_str,
     _to_str,
     _datetime_to_utc_string,
+    _get_content_md5,
 )
 from abc import ABCMeta
 from .._serialization import (
     _get_request_body,
     _convert_signed_identifiers_to_xml,
     _convert_service_properties_to_xml,
+    _add_metadata_headers,
 )
 from .._http import HTTPRequest
-from ._chunking import _download_blob_chunks
+from ._download_chunking import _download_blob_chunks
 from ..models import (
     Services,
     ListGenerator,
+    _OperationContext,
 )
 from .models import (
     Blob,
@@ -64,6 +72,8 @@ from .._deserialization import (
     _get_download_size,
     _parse_metadata,
     _parse_properties,
+    _convert_xml_to_service_stats,
+    _parse_length_from_content_range,
 )
 from ._serialization import (
     _get_path,
@@ -75,8 +85,7 @@ from ._deserialization import (
     _convert_xml_to_blob_list,
     _parse_container,
     _parse_snapshot_blob,
-    _parse_lease_time,
-    _parse_lease_id,
+    _parse_lease,
     _convert_xml_to_signed_identifiers_and_access,
     _parse_base_properties,
 )
@@ -100,10 +109,43 @@ class BaseBlobService(StorageClient):
     containers, and blobs. Within your storage account, containers provide a
     way to organize sets of blobs. For more information please see:
     https://msdn.microsoft.com/en-us/library/azure/ee691964.aspx
+
+    :ivar int MAX_SINGLE_GET_SIZE: 
+        The size of the first range get performed by get_blob_to_* methods if 
+        max_connections is greater than 1. Less data will be returned if the 
+        blob is smaller than this.
+    :ivar int MAX_CHUNK_GET_SIZE: 
+        The size of subsequent range gets performed by get_blob_to_* methods if 
+        max_connections is greater than 1 and the blob is larger than MAX_SINGLE_GET_SIZE. 
+        Less data will be returned if the remainder of the blob is smaller than 
+        this. If this is set to larger than 4MB, content_validation will throw an 
+        error if enabled. However, if content_validation is not desired a size 
+        greater than 4MB may be optimal. Setting this below 4MB is not recommended.
+    :ivar object key_encryption_key:
+        The key-encryption-key optionally provided by the user. If provided, will be used to
+        encrypt/decrypt in supported methods.
+        For methods requiring decryption, either the key_encryption_key OR the resolver must be provided.
+        If both are provided, the resolver will take precedence.
+        Must implement the following methods for APIs requiring encryption:
+        wrap_key(key)--wraps the specified key (bytes) using an algorithm of the user's choice. Returns the encrypted key as bytes.
+        get_key_wrap_algorithm()--returns the algorithm used to wrap the specified symmetric key.
+        get_kid()--returns a string key id for this key-encryption-key.
+        Must implement the following methods for APIs requiring decryption:
+        unwrap_key(key, algorithm)--returns the unwrapped form of the specified symmetric key using the string-specified algorithm.
+        get_kid()--returns a string key id for this key-encryption-key.
+    :ivar function key_resolver_function(kid):
+        A function to resolve keys optionally provided by the user. If provided, will be used to decrypt in supported methods.
+        For methods requiring decryption, either the key_encryption_key OR
+        the resolver must be provided. If both are provided, the resolver will take precedence.
+        It uses the kid string to return a key-encryption-key implementing the interface defined above.
+    :ivar bool require_encryption:
+        A flag that may be set to ensure that all messages successfully uploaded to the queue and all those downloaded and
+        successfully read from the queue are/were encrypted while on the server. If this flag is set, all required 
+        parameters for encryption/decryption must be provided. See the above comments on the key_encryption_key and resolver.
     '''
 
     __metaclass__ = ABCMeta
-    MAX_SINGLE_GET_SIZE = 64 * 1024 * 1024
+    MAX_SINGLE_GET_SIZE = 32 * 1024 * 1024
     MAX_CHUNK_GET_SIZE = 4 * 1024 * 1024
 
     def __init__(self, account_name=None, account_key=None, sas_token=None, 
@@ -143,7 +185,7 @@ class BaseBlobService(StorageClient):
             If specified, this will override all other parameters besides 
             request session. See
             http://azure.microsoft.com/en-us/documentation/articles/storage-configure-connection-string/
-            for the connection string format.
+            for the connection string format
         '''
         service_params = _ServiceParameters.get_service_parameters(
             'blob',
@@ -169,7 +211,11 @@ class BaseBlobService(StorageClient):
         else:
             self.authentication = _StorageNoAuthentication()
 
-    def make_blob_url(self, container_name, blob_name, protocol=None, sas_token=None):
+        self.require_encryption = False
+        self.key_encryption_key = None
+        self.key_resolver_function = None
+
+    def make_blob_url(self, container_name, blob_name, protocol=None, sas_token=None, snapshot=None):
         '''
         Creates the url to access a blob.
 
@@ -183,6 +229,9 @@ class BaseBlobService(StorageClient):
         :param str sas_token:
             Shared access signature token created with
             generate_shared_access_signature.
+        :param str snapshot:
+            An string value that uniquely identifies the snapshot. The value of
+            this query parameter indicates the snapshot version.
         :return: blob access URL.
         :rtype: str
         '''
@@ -194,8 +243,12 @@ class BaseBlobService(StorageClient):
             blob_name,
         )
 
-        if sas_token:
-            url += '?' + sas_token
+        if snapshot and sas_token:
+            url = '{}?snapshot={}&{}'.format(url, snapshot, sas_token)
+        elif snapshot:
+            url = '{}?snapshot={}'.format(url, snapshot)
+        elif sas_token:
+            url = '{}?{}'.format(url, sas_token)
 
         return url
 
@@ -370,8 +423,7 @@ class BaseBlobService(StorageClient):
         :type start: date or str
         :param str id:
             A unique value up to 64 characters in length that correlates to a 
-            stored access policy. To create a stored access policy, use 
-            set_blob_service_properties.
+            stored access policy. To create a stored access policy, use :func:`~set_container_acl`.
         :param str ip:
             Specifies an IP address or a range of IP addresses from which to accept requests.
             If the IP address from which the request originates does not match the IP address
@@ -452,15 +504,16 @@ class BaseBlobService(StorageClient):
             The timeout parameter is expressed in seconds.
         '''
         include = 'metadata' if include_metadata else None
+        operation_context = _OperationContext(location_lock=True)
         kwargs = {'prefix': prefix, 'marker': marker, 'max_results': num_results, 
-                'include': include, 'timeout': timeout}
+                'include': include, 'timeout': timeout, '_context': operation_context}
         resp = self._list_containers(**kwargs)
 
         return ListGenerator(resp, self._list_containers, (), kwargs)
 
 
     def _list_containers(self, prefix=None, marker=None, max_results=None, 
-                         include=None, timeout=None):
+                         include=None, timeout=None, _context=None):
         '''
         Returns a list of the containers under the specified account.
 
@@ -487,19 +540,18 @@ class BaseBlobService(StorageClient):
         '''
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path() 
-        request.query = [
-            ('comp', 'list'),
-            ('prefix', _to_str(prefix)),
-            ('marker', _to_str(marker)),
-            ('maxresults', _int_to_str(max_results)),
-            ('include', _to_str(include)),
-            ('timeout', _int_to_str(timeout))
-        ]
+        request.query = {
+            'comp': 'list',
+            'prefix': _to_str(prefix),
+            'marker': _to_str(marker),
+            'maxresults': _int_to_str(max_results),
+            'include': _to_str(include),
+            'timeout': _int_to_str(timeout)
+        }
 
-        response = self._perform_request(request)
-        return _convert_xml_to_containers(response)
+        return self._perform_request(request, _convert_xml_to_containers, operation_context=_context)
 
     def create_container(self, container_name, metadata=None,
                          public_access=None, fail_on_exist=False, timeout=None):
@@ -528,15 +580,16 @@ class BaseBlobService(StorageClient):
         _validate_not_none('container_name', container_name)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name)
-        request.query = [
-            ('restype', 'container'),
-            ('timeout', _int_to_str(timeout)),]
-        request.headers = [
-            ('x-ms-meta-name-values', metadata),
-            ('x-ms-blob-public-access', _to_str(public_access))
-        ]
+        request.query = {
+            'restype': 'container',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'x-ms-blob-public-access': _to_str(public_access)
+        }
+        _add_metadata_headers(metadata, request)
 
         if not fail_on_exist:
             try:
@@ -567,16 +620,15 @@ class BaseBlobService(StorageClient):
         _validate_not_none('container_name', container_name)
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path(container_name)
-        request.query = [
-            ('restype', 'container'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [('x-ms-lease-id', _to_str(lease_id))]
+        request.query = {
+            'restype': 'container',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {'x-ms-lease-id': _to_str(lease_id)}
 
-        response = self._perform_request(request)
-        return _parse_container(container_name, response)
+        return self._perform_request(request, _parse_container, [container_name])
 
     def get_container_metadata(self, container_name, lease_id=None, timeout=None):
         '''
@@ -596,17 +648,16 @@ class BaseBlobService(StorageClient):
         _validate_not_none('container_name', container_name)
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path(container_name)
-        request.query = [
-            ('restype', 'container'),
-            ('comp', 'metadata'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [('x-ms-lease-id', _to_str(lease_id))]
+        request.query = {
+            'restype': 'container',
+            'comp': 'metadata',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {'x-ms-lease-id': _to_str(lease_id)}
 
-        response = self._perform_request(request)
-        return _parse_metadata(response)
+        return self._perform_request(request, _parse_metadata)
 
     def set_container_metadata(self, container_name, metadata=None,
                                lease_id=None, if_modified_since=None, timeout=None):
@@ -639,21 +690,20 @@ class BaseBlobService(StorageClient):
         _validate_not_none('container_name', container_name)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name)
-        request.query = [
-            ('restype', 'container'),
-            ('comp', 'metadata'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-meta-name-values', metadata),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('x-ms-lease-id', _to_str(lease_id)),
-        ]
+        request.query = {
+            'restype': 'container',
+            'comp': 'metadata',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'x-ms-lease-id': _to_str(lease_id),
+        }
+        _add_metadata_headers(metadata, request)
 
-        response = self._perform_request(request)
-        return _parse_base_properties(response)
+        return self._perform_request(request, _parse_base_properties)
 
     def get_container_acl(self, container_name, lease_id=None, timeout=None):
         '''
@@ -675,17 +725,16 @@ class BaseBlobService(StorageClient):
         _validate_not_none('container_name', container_name)
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path(container_name)
-        request.query = [
-            ('restype', 'container'),
-            ('comp', 'acl'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [('x-ms-lease-id', _to_str(lease_id))]
+        request.query = {
+            'restype': 'container',
+            'comp': 'acl',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {'x-ms-lease-id': _to_str(lease_id)}
 
-        response = self._perform_request(request)
-        return _convert_xml_to_signed_identifiers_and_access(response)
+        return self._perform_request(request, _convert_xml_to_signed_identifiers_and_access)
 
     def set_container_acl(self, container_name, signed_identifiers=None,
                           public_access=None, lease_id=None,
@@ -721,26 +770,26 @@ class BaseBlobService(StorageClient):
         :rtype: :class:`~azure.storage.blob.models.ResourceProperties`
         '''
         _validate_not_none('container_name', container_name)
+        _validate_access_policies(signed_identifiers)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name)
-        request.query = [
-            ('restype', 'container'),
-            ('comp', 'acl'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-blob-public-access', _to_str(public_access)),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),
-            ('x-ms-lease-id', _to_str(lease_id)),
-        ]
+        request.query = {
+            'restype': 'container',
+            'comp': 'acl',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'x-ms-blob-public-access': _to_str(public_access),
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),
+            'x-ms-lease-id': _to_str(lease_id),
+        }
         request.body = _get_request_body(
             _convert_signed_identifiers_to_xml(signed_identifiers))
 
-        response = self._perform_request(request)
-        return _parse_base_properties(response)
+        return self._perform_request(request, _parse_base_properties)
 
     def delete_container(self, container_name, fail_not_exist=False,
                          lease_id=None, if_modified_since=None,
@@ -778,17 +827,17 @@ class BaseBlobService(StorageClient):
         _validate_not_none('container_name', container_name)
         request = HTTPRequest()
         request.method = 'DELETE'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name)
-        request.query = [
-            ('restype', 'container'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-lease-id', _to_str(lease_id)),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),          
-        ]
+        request.query = {
+            'restype': 'container',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'x-ms-lease-id': _to_str(lease_id),
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),          
+        }
 
         if not fail_not_exist:
             try:
@@ -806,8 +855,7 @@ class BaseBlobService(StorageClient):
         lease_break_period, proposed_lease_id, if_modified_since,
         if_unmodified_since, timeout):
         '''
-        Establishes and manages a lock on a container for delete operations.
-        The lock duration can be 15 to 60 seconds, or can be infinite.
+        Establishes and manages a lease on a container.
         The Lease Container operation can be called in one of five modes
             Acquire, to request a new lease
             Renew, to renew an existing lease
@@ -865,31 +913,32 @@ class BaseBlobService(StorageClient):
         _validate_not_none('lease_action', lease_action)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name)
-        request.query = [
-            ('restype', 'container'),
-            ('comp', 'lease'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-lease-id', _to_str(lease_id)),
-            ('x-ms-lease-action', _to_str(lease_action)),
-            ('x-ms-lease-duration', _to_str(lease_duration)),
-            ('x-ms-lease-break-period', _to_str(lease_break_period)),
-            ('x-ms-proposed-lease-id', _to_str(proposed_lease_id)),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),
-        ]
+        request.query = {
+            'restype': 'container',
+            'comp': 'lease',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'x-ms-lease-id': _to_str(lease_id),
+            'x-ms-lease-action': _to_str(lease_action),
+            'x-ms-lease-duration': _to_str(lease_duration),
+            'x-ms-lease-break-period': _to_str(lease_break_period),
+            'x-ms-proposed-lease-id': _to_str(proposed_lease_id),
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),
+        }
 
-        return self._perform_request(request)
+        return self._perform_request(request, _parse_lease)
 
     def acquire_container_lease(
         self, container_name, lease_duration=-1, proposed_lease_id=None,
         if_modified_since=None, if_unmodified_since=None, timeout=None):
         '''
-        Acquires a lock on a container for delete operations.
-        The lock duration can be 15 to 60 seconds or infinite.
+        Requests a new lease. If the container does not have an active lease,
+        the Blob service creates a lease on the container and returns a new
+        lease ID.
 
         :param str container_name:
             Name of existing container.
@@ -923,24 +972,27 @@ class BaseBlobService(StorageClient):
            (lease_duration < 15 or lease_duration > 60):
             raise ValueError(_ERROR_INVALID_LEASE_DURATION)
 
-        response = self._lease_container_impl(container_name, 
-                                          _LeaseActions.Acquire,
-                                          None, # lease_id
-                                          lease_duration,
-                                          None, # lease_break_period
-                                          proposed_lease_id,
-                                          if_modified_since,
-                                          if_unmodified_since,
-                                          timeout)
-        return _parse_lease_id(response)
+        lease = self._lease_container_impl(container_name, 
+                                           _LeaseActions.Acquire,
+                                           None, # lease_id
+                                           lease_duration,
+                                           None, # lease_break_period
+                                           proposed_lease_id,
+                                           if_modified_since,
+                                           if_unmodified_since,
+                                           timeout)
+        return lease['id']
 
     def renew_container_lease(
         self, container_name, lease_id, if_modified_since=None,
         if_unmodified_since=None, timeout=None):
         '''
-        Renews a lock on a container for delete operations.
-        The lock duration can be 15 to 60 seconds, or can be infinite.
-
+        Renews the lease. The lease can be renewed if the lease ID specified
+        matches that associated with the container. Note that
+        the lease may be renewed even if it has expired as long as the container
+        has not been leased again since the expiration of that lease. When you
+        renew a lease, the lease duration clock resets.
+        
         :param str container_name:
             Name of existing container.
         :param str lease_id:
@@ -964,25 +1016,24 @@ class BaseBlobService(StorageClient):
         '''
         _validate_not_none('lease_id', lease_id)
 
-        response =  self._lease_container_impl(container_name, 
-                                          _LeaseActions.Renew,
-                                          lease_id,
-                                          None, # lease_duration
-                                          None, # lease_break_period
-                                          None, # proposed_lease_id
-                                          if_modified_since,
-                                          if_unmodified_since,
-                                          timeout)
-        return _parse_lease_id(response)
+        lease = self._lease_container_impl(container_name, 
+                                           _LeaseActions.Renew,
+                                           lease_id,
+                                           None, # lease_duration
+                                           None, # lease_break_period
+                                           None, # proposed_lease_id
+                                           if_modified_since,
+                                           if_unmodified_since,
+                                           timeout)
+        return lease['id']
 
     def release_container_lease(
         self, container_name, lease_id, if_modified_since=None,
         if_unmodified_since=None, timeout=None):
         '''
-        Releases a lock on a container for delete operations, to free the
-        lease if it is no longer needed so that another client may
-        immediately acquire a lease against the container. The lock duration
-        can be 15 to 60 seconds, or can be infinite.
+        Release the lease. The lease may be released if the lease_id specified matches
+        that associated with the container. Releasing the lease allows another client
+        to immediately acquire the lease for the container as soon as the release is complete. 
 
         :param str container_name:
             Name of existing container.
@@ -1019,10 +1070,13 @@ class BaseBlobService(StorageClient):
         self, container_name, lease_break_period=None,
         if_modified_since=None, if_unmodified_since=None, timeout=None):
         '''
-        Breaks a lock on a container for delete operations.
-        Use to end the lease but ensure that another client cannot
-        acquire a new lease until the current lease period has expired.
-        The lock duration can be 15 to 60 seconds, or can be infinite.
+        Break the lease, if the container has an active lease. Once a lease is
+        broken, it cannot be renewed. Any authorized request can break the lease;
+        the request is not required to specify a matching lease ID. When a lease
+        is broken, the lease break period is allowed to elapse, during which time
+        no lease operation except break and release can be performed on the container.
+        When a lease is successfully broken, the response indicates the interval
+        in seconds until a new lease can be acquired. 
 
         :param str container_name:
             Name of existing container.
@@ -1056,23 +1110,23 @@ class BaseBlobService(StorageClient):
         if (lease_break_period is not None) and (lease_break_period < 0 or lease_break_period > 60):
             raise ValueError(_ERROR_INVALID_LEASE_BREAK_PERIOD)
         
-        response = self._lease_container_impl(container_name, 
-                                          _LeaseActions.Break,
-                                          None, # lease_id
-                                          None, # lease_duration
-                                          lease_break_period,
-                                          None, # proposed_lease_id
-                                          if_modified_since,
-                                          if_unmodified_since,
-                                          timeout)
-        return _parse_lease_time(response)
+        lease = self._lease_container_impl(container_name, 
+                                           _LeaseActions.Break,
+                                           None, # lease_id
+                                           None, # lease_duration
+                                           lease_break_period,
+                                           None, # proposed_lease_id
+                                           if_modified_since,
+                                           if_unmodified_since,
+                                           timeout)
+        return lease['time']
 
     def change_container_lease(
         self, container_name, lease_id, proposed_lease_id,
         if_modified_since=None, if_unmodified_since=None, timeout=None):
         '''
-        Changes the lease ID for a lock on a container for delete operations.
-        The lock duration can be 15 to 60 seconds, or can be infinite.
+        Change the lease ID of an active lease. A change must include the current
+        lease ID and a new lease ID.
 
         :param str container_name:
             Name of existing container.
@@ -1148,15 +1202,18 @@ class BaseBlobService(StorageClient):
         :param int timeout:
             The timeout parameter is expressed in seconds.
         '''
+        operation_context = _OperationContext(location_lock=True)
         args = (container_name,)
         kwargs = {'prefix': prefix, 'marker': marker, 'max_results': num_results, 
-                'include': include, 'delimiter': delimiter, 'timeout': timeout}
+                'include': include, 'delimiter': delimiter, 'timeout': timeout,
+                '_context': operation_context}
         resp = self._list_blobs(*args, **kwargs)
 
         return ListGenerator(resp, self._list_blobs, args, kwargs)
 
     def _list_blobs(self, container_name, prefix=None, marker=None,
-                   max_results=None, include=None, delimiter=None, timeout=None):
+                   max_results=None, include=None, delimiter=None, timeout=None,
+                   _context=None):
         '''
         Returns the list of blobs under the specified container.
 
@@ -1208,21 +1265,56 @@ class BaseBlobService(StorageClient):
         _validate_not_none('container_name', container_name)
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path(container_name)
-        request.query = [
-            ('restype', 'container'),
-            ('comp', 'list'),
-            ('prefix', _to_str(prefix)),
-            ('delimiter', _to_str(delimiter)),
-            ('marker', _to_str(marker)),
-            ('maxresults', _int_to_str(max_results)),
-            ('include', _to_str(include)),
-            ('timeout', _int_to_str(timeout)),
-        ]
+        request.query = {
+            'restype': 'container',
+            'comp': 'list',
+            'prefix': _to_str(prefix),
+            'delimiter': _to_str(delimiter),
+            'marker': _to_str(marker),
+            'maxresults': _int_to_str(max_results),
+            'include': _to_str(include),
+            'timeout': _int_to_str(timeout),
+        }
 
-        response = self._perform_request(request)
-        return _convert_xml_to_blob_list(response)
+        return self._perform_request(request, _convert_xml_to_blob_list, operation_context=_context)
+
+    def get_blob_service_stats(self, timeout=None):
+        '''
+        Retrieves statistics related to replication for the Blob service. It is 
+        only available when read-access geo-redundant replication is enabled for 
+        the storage account.
+
+        With geo-redundant replication, Azure Storage maintains your data durable 
+        in two locations. In both locations, Azure Storage constantly maintains 
+        multiple healthy replicas of your data. The location where you read, 
+        create, update, or delete data is the primary storage account location. 
+        The primary location exists in the region you choose at the time you 
+        create an account via the Azure Management Azure classic portal, for 
+        example, North Central US. The location to which your data is replicated 
+        is the secondary location. The secondary location is automatically 
+        determined based on the location of the primary; it is in a second data 
+        center that resides in the same region as the primary location. Read-only 
+        access is available from the secondary location, if read-access geo-redundant 
+        replication is enabled for your storage account.
+
+        :param int timeout:
+            The timeout parameter is expressed in seconds.
+        :return: The blob service stats.
+        :rtype: :class:`~azure.storage.models.ServiceStats`
+        '''
+        request = HTTPRequest()
+        request.method = 'GET'
+        request.host_locations = self._get_host_locations(primary=False, secondary=True)
+        request.path = _get_path()
+        request.query = {
+            'restype': 'service',
+            'comp': 'stats',
+            'timeout': _int_to_str(timeout),
+        }
+
+        return self._perform_request(request, _convert_xml_to_service_stats)
 
     def set_blob_service_properties(
         self, logging=None, hour_metrics=None, minute_metrics=None,
@@ -1253,13 +1345,13 @@ class BaseBlobService(StorageClient):
         '''
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path() 
-        request.query = [
-            ('restype', 'service'),
-            ('comp', 'properties'),
-            ('timeout', _int_to_str(timeout)),
-        ]
+        request.query = {
+            'restype': 'service',
+            'comp': 'properties',
+            'timeout': _int_to_str(timeout),
+        }
         request.body = _get_request_body(
             _convert_service_properties_to_xml(logging, hour_metrics, minute_metrics, cors, target_version))
 
@@ -1279,16 +1371,15 @@ class BaseBlobService(StorageClient):
         '''
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path() 
-        request.query = [
-            ('restype', 'service'),
-            ('comp', 'properties'),
-            ('timeout', _int_to_str(timeout)),
-        ]
+        request.query = {
+            'restype': 'service',
+            'comp': 'properties',
+            'timeout': _int_to_str(timeout),
+        }
 
-        response = self._perform_request(request)
-        return _convert_xml_to_service_properties(response.body)
+        return self._perform_request(request, _convert_xml_to_service_properties)
 
     def get_blob_properties(
         self, container_name, blob_name, snapshot=None, lease_id=None,
@@ -1338,22 +1429,21 @@ class BaseBlobService(StorageClient):
         _validate_not_none('blob_name', blob_name)
         request = HTTPRequest()
         request.method = 'HEAD'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path(container_name, blob_name)
-        request.query = [
-            ('snapshot', _to_str(snapshot)),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-lease-id', _to_str(lease_id)),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),
-            ('If-Match', _to_str(if_match)),
-            ('If-None-Match', _to_str(if_none_match)),
-        ]
+        request.query = {
+            'snapshot': _to_str(snapshot),
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'x-ms-lease-id': _to_str(lease_id),
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),
+            'If-Match': _to_str(if_match),
+            'If-None-Match': _to_str(if_none_match),
+        }
 
-        response = self._perform_request(request)
-        return _parse_blob(blob_name, snapshot, response)
+        return self._perform_request(request, _parse_blob, [blob_name, snapshot])
 
     def set_blob_properties(
         self, container_name, blob_name, content_settings=None, lease_id=None,
@@ -1401,24 +1491,23 @@ class BaseBlobService(StorageClient):
         _validate_not_none('blob_name', blob_name)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name, blob_name)
-        request.query = [
-            ('comp', 'properties'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers += [
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),
-            ('If-Match', _to_str(if_match)),
-            ('If-None-Match', _to_str(if_none_match)),
-            ('x-ms-lease-id', _to_str(lease_id))
-        ]
+        request.query = {
+            'comp': 'properties',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),
+            'If-Match': _to_str(if_match),
+            'If-None-Match': _to_str(if_none_match),
+            'x-ms-lease-id': _to_str(lease_id)
+        }
         if content_settings is not None:
-            request.headers += content_settings._to_headers()
+            request.headers.update(content_settings._to_headers())
 
-        response = self._perform_request(request)
-        return _parse_base_properties(response)
+        return self._perform_request(request, _parse_base_properties)
 
     def exists(self, container_name, blob_name=None, snapshot=None, timeout=None):
         '''
@@ -1450,8 +1539,9 @@ class BaseBlobService(StorageClient):
 
     def _get_blob(
         self, container_name, blob_name, snapshot=None, start_range=None,
-        end_range=None, range_get_content_md5=None, lease_id=None, if_modified_since=None,
-        if_unmodified_since=None, if_match=None, if_none_match=None, timeout=None):
+        end_range=None, validate_content=False, lease_id=None, if_modified_since=None,
+        if_unmodified_since=None, if_match=None, if_none_match=None, timeout=None, 
+        _context=None):
         '''
         Downloads a blob's content, metadata, and properties. You can also
         call this API to read a snapshot. You can specify a range if you don't
@@ -1478,10 +1568,10 @@ class BaseBlobService(StorageClient):
             If end_range is given, start_range must be provided.
             The start_range and end_range params are inclusive.
             Ex: start_range=0, end_range=511 will download first 512 bytes of blob.
-        :param bool range_get_content_md5:
-            When this header is set to True and specified together
-            with the Range header, the service returns the MD5 hash for the
-            range, as long as the range is less than or equal to 4 MB in size.
+        :param bool validate_content:
+            When this is set to True and specified together with the Range header, 
+            the service returns the MD5 hash for the range, as long as the range 
+            is less than or equal to 4 MB in size.
         :param str lease_id:
             Required if the blob has an active lease.
         :param datetime if_modified_since:
@@ -1512,39 +1602,65 @@ class BaseBlobService(StorageClient):
         '''
         _validate_not_none('container_name', container_name)
         _validate_not_none('blob_name', blob_name)
+        _validate_decryption_required(self.require_encryption,
+                                      self.key_encryption_key,
+                                      self.key_resolver_function)
+
+        start_offset, end_offset = 0,0
+        if self.key_encryption_key is not None or self.key_resolver_function is not None:
+            if start_range is not None:
+                # Align the start of the range along a 16 byte block
+                start_offset = start_range % 16
+                start_range -= start_offset
+
+                # Include an extra 16 bytes for the IV if necessary
+                # Because of the previous offsetting, start_range will always
+                # be a multiple of 16.
+                if start_range > 0:
+                    start_offset += 16
+                    start_range -= 16
+
+            if end_range is not None:
+                # Align the end of the range along a 16 byte block
+                end_offset = 15 - (end_range % 16)
+                end_range += end_offset
+
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path(container_name, blob_name)
-        request.query = [
-            ('snapshot', _to_str(snapshot)),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-lease-id', _to_str(lease_id)),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),
-            ('If-Match', _to_str(if_match)),
-            ('If-None-Match', _to_str(if_none_match)),
-        ]
+        request.query = {
+            'snapshot': _to_str(snapshot),
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'x-ms-lease-id': _to_str(lease_id),
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),
+            'If-Match': _to_str(if_match),
+            'If-None-Match': _to_str(if_none_match),
+        }
         _validate_and_format_range_headers(
             request,
             start_range,
             end_range,
             start_range_required=False,
             end_range_required=False,
-            check_content_md5=range_get_content_md5)
+            check_content_md5=validate_content)
 
-        response = self._perform_request(request, None)
-        return _parse_blob(blob_name, snapshot, response)
+        return self._perform_request(request, _parse_blob, 
+                                     [blob_name, snapshot, validate_content, self.require_encryption,
+                                      self.key_encryption_key, self.key_resolver_function,
+                                      start_offset, end_offset],
+                                     operation_context=_context)
 
     def get_blob_to_path(
         self, container_name, blob_name, file_path, open_mode='wb',
         snapshot=None, start_range=None, end_range=None,
-        range_get_content_md5=None, progress_callback=None,
-        max_connections=1, max_retries=5, retry_wait=1.0, lease_id=None,
-        if_modified_since=None, if_unmodified_since=None,
-        if_match=None, if_none_match=None, timeout=None):
+        validate_content=False, progress_callback=None,
+        max_connections=2, lease_id=None, if_modified_since=None, 
+        if_unmodified_since=None, if_match=None, if_none_match=None, 
+        timeout=None):
         '''
         Downloads a blob to a file path, with automatic chunking and progress
         notifications. Returns an instance of :class:`Blob` with 
@@ -1557,7 +1673,9 @@ class BaseBlobService(StorageClient):
         :param str file_path:
             Path of file to write out to.
         :param str open_mode:
-            Mode to use when opening the file.
+            Mode to use when opening the file. Note that specifying append only 
+            open_mode prevents parallel download. So, max_connections must be set 
+            to 1 if this open_mode is used.
         :param str snapshot:
             The snapshot parameter is an opaque DateTime value that,
             when present, specifies the blob snapshot to retrieve.
@@ -1571,23 +1689,34 @@ class BaseBlobService(StorageClient):
             If end_range is given, start_range must be provided.
             The start_range and end_range params are inclusive.
             Ex: start_range=0, end_range=511 will download first 512 bytes of blob.
-        :param bool range_get_content_md5:
-            When this header is set to True and specified together
-            with the Range header, the service returns the MD5 hash for the
-            range, as long as the range is less than or equal to 4 MB in size.
+        :param bool validate_content:
+            If set to true, validates an MD5 hash for each retrieved portion of 
+            the blob. This is primarily valuable for detecting bitflips on the wire 
+            if using http instead of https as https (the default) will already 
+            validate. Note that the service will only return transactional MD5s 
+            for chunks 4MB or less so the first get request will be of size 
+            self.MAX_CHUNK_GET_SIZE instead of self.MAX_SINGLE_GET_SIZE. If 
+            self.MAX_CHUNK_GET_SIZE was set to greater than 4MB an error will be 
+            thrown. As computing the MD5 takes processing time and more requests 
+            will need to be done due to the reduced chunk size there may be some 
+            increase in latency.
         :param progress_callback:
             Callback for progress with signature function(current, total) 
             where current is the number of bytes transfered so far, and total is 
             the size of the blob if known.
         :type progress_callback: callback function in format of func(current, total)
         :param int max_connections:
-            Set to 1 to download the blob sequentially.
-            Set to 2 or greater if you want to download a blob larger than 64MB in chunks.
-            If the blob size does not exceed 64MB it will be downloaded in one chunk.
-        :param int max_retries:
-            Number of times to retry download of blob chunk if an error occurs.
-        :param int retry_wait:
-            Sleep time in secs between retries.
+            If set to 2 or greater, an initial get will be done for the first 
+            self.MAX_SINGLE_GET_SIZE bytes of the blob. If this is the entire blob, 
+            the method returns at this point. If it is not, it will download the 
+            remaining data parallel using the number of threads equal to 
+            max_connections. Each chunk will be of size self.MAX_CHUNK_GET_SIZE.
+            If set to 1, a single large get request will be done. This is not 
+            generally recommended but available if very few threads should be 
+            used, network requests are very expensive, or a non-seekable stream 
+            prevents parallel download. This may also be useful if many blobs are 
+            expected to be empty as an extra request is required for empty blobs 
+            if max_connections is greater than 1.
         :param str lease_id:
             Required if the blob has an active lease.
         :param datetime if_modified_since:
@@ -1615,13 +1744,19 @@ class BaseBlobService(StorageClient):
             The timeout parameter is expressed in seconds. This method may make 
             multiple calls to the Azure service and the timeout will apply to 
             each call individually.
-        :return: A Blob with properties and metadata.
+        :return: A Blob with properties and metadata. If max_connections is greater 
+            than 1, the content_md5 (if set on the blob) will not be returned. If you 
+            require this value, either use get_blob_properties or set max_connections 
+            to 1.
         :rtype: :class:`~azure.storage.blob.models.Blob`
         '''
         _validate_not_none('container_name', container_name)
         _validate_not_none('blob_name', blob_name)
         _validate_not_none('file_path', file_path)
         _validate_not_none('open_mode', open_mode)
+
+        if max_connections > 1 and 'a' in open_mode:
+            raise ValueError(_ERROR_PARALLEL_NOT_SEEKABLE)
 
         with open(file_path, open_mode) as stream:
             blob = self.get_blob_to_stream(
@@ -1631,11 +1766,9 @@ class BaseBlobService(StorageClient):
                 snapshot,
                 start_range,
                 end_range,
-                range_get_content_md5,
+                validate_content,
                 progress_callback,
                 max_connections,
-                max_retries,
-                retry_wait,
                 lease_id,
                 if_modified_since,
                 if_unmodified_since,
@@ -1647,10 +1780,10 @@ class BaseBlobService(StorageClient):
 
     def get_blob_to_stream(
         self, container_name, blob_name, stream, snapshot=None,
-        start_range=None, end_range=None, range_get_content_md5=None,
-        progress_callback=None, max_connections=1, max_retries=5,
-        retry_wait=1.0, lease_id=None, if_modified_since=None,
-        if_unmodified_since=None, if_match=None, if_none_match=None, timeout=None):
+        start_range=None, end_range=None, validate_content=False,
+        progress_callback=None, max_connections=2, lease_id=None, 
+        if_modified_since=None, if_unmodified_since=None, if_match=None, 
+        if_none_match=None, timeout=None):
 
         '''
         Downloads a blob to a stream, with automatic chunking and progress
@@ -1676,23 +1809,34 @@ class BaseBlobService(StorageClient):
             If end_range is given, start_range must be provided.
             The start_range and end_range params are inclusive.
             Ex: start_range=0, end_range=511 will download first 512 bytes of blob.
-        :param bool range_get_content_md5:
-            When this header is set to True and specified together
-            with the Range header, the service returns the MD5 hash for the
-            range, as long as the range is less than or equal to 4 MB in size.
+        :param bool validate_content:
+            If set to true, validates an MD5 hash for each retrieved portion of 
+            the blob. This is primarily valuable for detecting bitflips on the wire 
+            if using http instead of https as https (the default) will already 
+            validate. Note that the service will only return transactional MD5s 
+            for chunks 4MB or less so the first get request will be of size 
+            self.MAX_CHUNK_GET_SIZE instead of self.MAX_SINGLE_GET_SIZE. If 
+            self.MAX_CHUNK_GET_SIZE was set to greater than 4MB an error will be 
+            thrown. As computing the MD5 takes processing time and more requests 
+            will need to be done due to the reduced chunk size there may be some 
+            increase in latency.
         :param progress_callback:
             Callback for progress with signature function(current, total) 
             where current is the number of bytes transfered so far, and total is 
             the size of the blob if known.
         :type progress_callback: callback function in format of func(current, total)
         :param int max_connections:
-            Set to 1 to download the blob sequentially.
-            Set to 2 or greater if you want to download a blob larger than 64MB in chunks.
-            If the blob size does not exceed 64MB it will be downloaded in one chunk.
-        :param int max_retries:
-            Number of times to retry download of blob chunk if an error occurs.
-        :param int retry_wait:
-            Sleep time in secs between retries.
+            If set to 2 or greater, an initial get will be done for the first 
+            self.MAX_SINGLE_GET_SIZE bytes of the blob. If this is the entire blob, 
+            the method returns at this point. If it is not, it will download the 
+            remaining data parallel using the number of threads equal to 
+            max_connections. Each chunk will be of size self.MAX_CHUNK_GET_SIZE.
+            If set to 1, a single large get request will be done. This is not 
+            generally recommended but available if very few threads should be 
+            used, network requests are very expensive, or a non-seekable stream 
+            prevents parallel download. This may also be useful if many blobs are 
+            expected to be empty as an extra request is required for empty blobs 
+            if max_connections is greater than 1.
         :param str lease_id:
             Required if the blob has an active lease.
         :param datetime if_modified_since:
@@ -1720,80 +1864,165 @@ class BaseBlobService(StorageClient):
             The timeout parameter is expressed in seconds. This method may make 
             multiple calls to the Azure service and the timeout will apply to 
             each call individually.
-        :return: A Blob with properties and metadata.
+        :return: A Blob with properties and metadata. If max_connections is greater 
+            than 1, the content_md5 (if set on the blob) will not be returned. If you 
+            require this value, either use get_blob_properties or set max_connections 
+            to 1.
         :rtype: :class:`~azure.storage.blob.models.Blob`
         '''
         _validate_not_none('container_name', container_name)
         _validate_not_none('blob_name', blob_name)
         _validate_not_none('stream', stream)
 
-        if sys.version_info >= (3,) and max_connections > 1 and not stream.seekable():
-            raise ValueError(_ERROR_PARALLEL_NOT_SEEKABLE)
+        # If the user explicitly sets max_connections to 1, do a single shot download
+        if max_connections == 1:
+            blob = self._get_blob(container_name,
+                                  blob_name,
+                                  snapshot,
+                                  start_range=start_range,
+                                  end_range=end_range,
+                                  validate_content=validate_content,
+                                  lease_id=lease_id,
+                                  if_modified_since=if_modified_since,
+                                  if_unmodified_since=if_unmodified_since,
+                                  if_match=if_match,
+                                  if_none_match=if_none_match,
+                                  timeout=timeout)
 
-        # Only get properties if parallelism will actually be used
-        blob_size = None
-        if max_connections > 1 and range_get_content_md5 is None:
-            blob = self.get_blob_properties(container_name, blob_name, timeout=timeout)
-            blob_size = blob.properties.content_length
+            # Set the download size
+            download_size = blob.properties.content_length
 
-            # If blob size is large, use parallel download
-            if blob_size >= self.MAX_SINGLE_GET_SIZE:
-                _download_blob_chunks(
-                    self,
-                    container_name,
-                    blob_name,
-                    blob_size,
-                    self.MAX_CHUNK_GET_SIZE,
-                    start_range,
-                    end_range,
-                    stream,
-                    max_connections,
-                    max_retries,
-                    retry_wait,
-                    progress_callback,
-                    if_modified_since,
-                    if_unmodified_since,
-                    if_match,
-                    if_none_match,
-                    timeout,
-                )
-                return blob
+        # If max_connections is greater than 1, do the first get to establish the 
+        # size of the blob and get the first segment of data
+        else:       
+            if sys.version_info >= (3,) and not stream.seekable():
+                raise ValueError(_ERROR_PARALLEL_NOT_SEEKABLE)
 
-        # If parallelism is off or the blob is small, do a single download
-        download_size = _get_download_size(start_range, end_range, blob_size)
+            # The service only provides transactional MD5s for chunks under 4MB.           
+            # If validate_content is on, get only self.MAX_CHUNK_GET_SIZE for the first 
+            # chunk so a transactional MD5 can be retrieved.
+            first_get_size = self.MAX_SINGLE_GET_SIZE if not validate_content else self.MAX_CHUNK_GET_SIZE
+
+            initial_request_start = start_range if start_range else 0
+
+            if end_range and end_range - start_range < first_get_size:
+                initial_request_end = end_range
+            else:
+                initial_request_end = initial_request_start + first_get_size - 1
+
+            # Send a context object to make sure we always retry to the initial location
+            operation_context = _OperationContext(location_lock=True)
+            try:
+                blob = self._get_blob(container_name,
+                                      blob_name,
+                                      snapshot,
+                                      start_range=initial_request_start,
+                                      end_range=initial_request_end,
+                                      validate_content=validate_content,
+                                      lease_id=lease_id,
+                                      if_modified_since=if_modified_since,
+                                      if_unmodified_since=if_unmodified_since,
+                                      if_match=if_match,
+                                      if_none_match=if_none_match,
+                                      timeout=timeout,
+                                      _context=operation_context)
+
+                # Parse the total blob size and adjust the download size if ranges 
+                # were specified
+                blob_size = _parse_length_from_content_range(blob.properties.content_range)
+                if end_range:
+                    # Use the end_range unless it is over the end of the blob
+                    download_size = min(blob_size, end_range - start_range + 1)
+                elif start_range:
+                    download_size = blob_size - start_range
+                else:
+                    download_size = blob_size
+            except AzureHttpError as ex:
+                if not start_range and ex.status_code == 416:
+                    # Get range will fail on an empty blob. If the user did not 
+                    # request a range, do a regular get request in order to get 
+                    # any properties.
+                    blob = self._get_blob(container_name,
+                                          blob_name,
+                                          snapshot,
+                                          validate_content=validate_content,
+                                          lease_id=lease_id,
+                                          if_modified_since=if_modified_since,
+                                          if_unmodified_since=if_unmodified_since,
+                                          if_match=if_match,
+                                          if_none_match=if_none_match,
+                                          timeout=timeout,
+                                          _context=operation_context)
+
+                    # Set the download size to empty
+                    download_size = 0
+                else:
+                    raise ex
+
+        # Mark the first progress chunk. If the blob is small or this is a single 
+        # shot download, this is the only call
         if progress_callback:
-            progress_callback(0, download_size)
+            progress_callback(blob.properties.content_length, download_size)
 
-        blob = self._get_blob(container_name,
-                              blob_name,
-                              snapshot,
-                              start_range=start_range,
-                              end_range=end_range,
-                              range_get_content_md5=range_get_content_md5,
-                              lease_id=lease_id,
-                              if_modified_since=if_modified_since,
-                              if_unmodified_since=if_unmodified_since,
-                              if_match=if_match,
-                              if_none_match=if_none_match,
-                              timeout=timeout)
-
+        # Write the content to the user stream  
+        # Clear blob content since output has been written to user stream   
         if blob.content is not None:
             stream.write(blob.content)
-    
-        if progress_callback:
-            download_size = len(blob.content)
-            progress_callback(download_size, download_size)
+            blob.content = None
 
-        blob.content = None # Clear blob content since output has been written to user stream
+        # If the blob is small or single shot download was used, the download is 
+        # complete at this point. If blob size is large, use parallel download.
+        if blob.properties.content_length != download_size:       
+            # Lock on the etag. This can be overriden by the user by specifying '*'
+            if_match = if_match if if_match is not None else blob.properties.etag    
+            
+            end_blob = blob_size
+            if end_range:
+                # Use the end_range unless it is over the end of the blob
+                end_blob = min(blob_size, end_range + 1)
+               
+            _download_blob_chunks(
+                self,
+                container_name,
+                blob_name,
+                download_size,
+                self.MAX_CHUNK_GET_SIZE,
+                first_get_size,
+                initial_request_end + 1, # start where the first download ended
+                end_blob,
+                stream,
+                max_connections,
+                progress_callback,
+                validate_content,
+                lease_id,
+                if_modified_since,
+                if_unmodified_since,
+                if_match,
+                if_none_match,
+                timeout,
+                operation_context
+            )
+
+            # Set the content length to the download size instead of the size of 
+            # the last range
+            blob.properties.content_length = download_size
+
+            # Overwrite the content range to the user requested range
+            blob.properties.content_range = 'bytes {0}-{1}/{2}'.format(start_range, end_range, blob_size)
+
+            # Overwrite the content MD5 as it is the MD5 for the last range instead 
+            # of the stored MD5
+            # TODO: Set to the stored MD5 when the service returns this
+            blob.properties.content_md5 = None
+
         return blob
         
     def get_blob_to_bytes(
         self, container_name, blob_name, snapshot=None,
-        start_range=None, end_range=None, range_get_content_md5=None,
-        progress_callback=None, max_connections=1, max_retries=5,
-        retry_wait=1.0, lease_id=None, if_modified_since=None,
-        if_unmodified_since=None, if_match=None, if_none_match=None,
-        timeout=None):
+        start_range=None, end_range=None, validate_content=False,
+        progress_callback=None, max_connections=2, lease_id=None, 
+        if_modified_since=None, if_unmodified_since=None, if_match=None, 
+        if_none_match=None, timeout=None):
         '''
         Downloads a blob as an array of bytes, with automatic chunking and
         progress notifications. Returns an instance of :class:`Blob` with
@@ -1816,23 +2045,34 @@ class BaseBlobService(StorageClient):
             If end_range is given, start_range must be provided.
             The start_range and end_range params are inclusive.
             Ex: start_range=0, end_range=511 will download first 512 bytes of blob.
-        :param bool range_get_content_md5:
-            When this header is set to True and specified together
-            with the Range header, the service returns the MD5 hash for the
-            range, as long as the range is less than or equal to 4 MB in size.
+        :param bool validate_content:
+            If set to true, validates an MD5 hash for each retrieved portion of 
+            the blob. This is primarily valuable for detecting bitflips on the wire 
+            if using http instead of https as https (the default) will already 
+            validate. Note that the service will only return transactional MD5s 
+            for chunks 4MB or less so the first get request will be of size 
+            self.MAX_CHUNK_GET_SIZE instead of self.MAX_SINGLE_GET_SIZE. If 
+            self.MAX_CHUNK_GET_SIZE was set to greater than 4MB an error will be 
+            thrown. As computing the MD5 takes processing time and more requests 
+            will need to be done due to the reduced chunk size there may be some 
+            increase in latency.
         :param progress_callback:
             Callback for progress with signature function(current, total) 
             where current is the number of bytes transfered so far, and total is 
             the size of the blob if known.
         :type progress_callback: callback function in format of func(current, total)
         :param int max_connections:
-            Set to 1 to download the blob sequentially.
-            Set to 2 or greater if you want to download a blob larger than 64MB in chunks.
-            If the blob size does not exceed 64MB it will be downloaded in one chunk.
-        :param int max_retries:
-            Number of times to retry download of blob chunk if an error occurs.
-        :param int retry_wait:
-            Sleep time in secs between retries.
+            If set to 2 or greater, an initial get will be done for the first 
+            self.MAX_SINGLE_GET_SIZE bytes of the blob. If this is the entire blob, 
+            the method returns at this point. If it is not, it will download the 
+            remaining data parallel using the number of threads equal to 
+            max_connections. Each chunk will be of size self.MAX_CHUNK_GET_SIZE.
+            If set to 1, a single large get request will be done. This is not 
+            generally recommended but available if very few threads should be 
+            used, network requests are very expensive, or a non-seekable stream 
+            prevents parallel download. This may also be useful if many blobs are 
+            expected to be empty as an extra request is required for empty blobs 
+            if max_connections is greater than 1.
         :param str lease_id:
             Required if the blob has an active lease.
         :param datetime if_modified_since:
@@ -1860,7 +2100,10 @@ class BaseBlobService(StorageClient):
             The timeout parameter is expressed in seconds. This method may make 
             multiple calls to the Azure service and the timeout will apply to 
             each call individually.
-        :return: A Blob with content, properties, and metadata.
+        :return: A Blob with properties and metadata. If max_connections is greater 
+            than 1, the content_md5 (if set on the blob) will not be returned. If you 
+            require this value, either use get_blob_properties or set max_connections 
+            to 1.
         :rtype: :class:`~azure.storage.blob.models.Blob`
         '''
         _validate_not_none('container_name', container_name)
@@ -1874,11 +2117,9 @@ class BaseBlobService(StorageClient):
             snapshot,
             start_range,
             end_range,
-            range_get_content_md5,
+            validate_content,
             progress_callback,
             max_connections,
-            max_retries,
-            retry_wait,
             lease_id,
             if_modified_since,
             if_unmodified_since,
@@ -1891,11 +2132,10 @@ class BaseBlobService(StorageClient):
 
     def get_blob_to_text(
         self, container_name, blob_name, encoding='utf-8', snapshot=None,
-        start_range=None, end_range=None, range_get_content_md5=None,
-        progress_callback=None, max_connections=1, max_retries=5,
-        retry_wait=1.0, lease_id=None, if_modified_since=None,
-        if_unmodified_since=None, if_match=None, if_none_match=None,
-        timeout=None):
+        start_range=None, end_range=None, validate_content=False,
+        progress_callback=None, max_connections=2, lease_id=None, 
+        if_modified_since=None, if_unmodified_since=None, if_match=None, 
+        if_none_match=None, timeout=None):
         '''
         Downloads a blob as unicode text, with automatic chunking and progress
         notifications. Returns an instance of :class:`Blob` with
@@ -1920,23 +2160,34 @@ class BaseBlobService(StorageClient):
             If end_range is given, start_range must be provided.
             The start_range and end_range params are inclusive.
             Ex: start_range=0, end_range=511 will download first 512 bytes of blob.
-        :param bool range_get_content_md5:
-            When this header is set to True and specified together
-            with the Range header, the service returns the MD5 hash for the
-            range, as long as the range is less than or equal to 4 MB in size.
+        :param bool validate_content:
+            If set to true, validates an MD5 hash for each retrieved portion of 
+            the blob. This is primarily valuable for detecting bitflips on the wire 
+            if using http instead of https as https (the default) will already 
+            validate. Note that the service will only return transactional MD5s 
+            for chunks 4MB or less so the first get request will be of size 
+            self.MAX_CHUNK_GET_SIZE instead of self.MAX_SINGLE_GET_SIZE. If 
+            self.MAX_CHUNK_GET_SIZE was set to greater than 4MB an error will be 
+            thrown. As computing the MD5 takes processing time and more requests 
+            will need to be done due to the reduced chunk size there may be some 
+            increase in latency.
         :param progress_callback:
             Callback for progress with signature function(current, total) 
             where current is the number of bytes transfered so far, and total is 
             the size of the blob if known.
         :type progress_callback: callback function in format of func(current, total)
         :param int max_connections:
-            Set to 1 to download the blob sequentially.
-            Set to 2 or greater if you want to download a blob larger than 64MB in chunks.
-            If the blob size does not exceed 64MB it will be downloaded in one chunk.
-        :param int max_retries:
-            Number of times to retry download of blob chunk if an error occurs.
-        :param int retry_wait:
-            Sleep time in secs between retries.
+            If set to 2 or greater, an initial get will be done for the first 
+            self.MAX_SINGLE_GET_SIZE bytes of the blob. If this is the entire blob, 
+            the method returns at this point. If it is not, it will download the 
+            remaining data parallel using the number of threads equal to 
+            max_connections. Each chunk will be of size self.MAX_CHUNK_GET_SIZE.
+            If set to 1, a single large get request will be done. This is not 
+            generally recommended but available if very few threads should be 
+            used, network requests are very expensive, or a non-seekable stream 
+            prevents parallel download. This may also be useful if many blobs are 
+            expected to be empty as an extra request is required for empty blobs 
+            if max_connections is greater than 1.
         :param str lease_id:
             Required if the blob has an active lease.
         :param datetime if_modified_since:
@@ -1964,7 +2215,10 @@ class BaseBlobService(StorageClient):
             The timeout parameter is expressed in seconds. This method may make 
             multiple calls to the Azure service and the timeout will apply to 
             each call individually.
-        :return: A Blob with content, properties, and metadata.
+        :return: A Blob with properties and metadata. If max_connections is greater 
+            than 1, the content_md5 (if set on the blob) will not be returned. If you 
+            require this value, either use get_blob_properties or set max_connections 
+            to 1.
         :rtype: :class:`~azure.storage.blob.models.Blob`
         '''
         _validate_not_none('container_name', container_name)
@@ -1976,11 +2230,9 @@ class BaseBlobService(StorageClient):
                                         snapshot,
                                         start_range,
                                         end_range,
-                                        range_get_content_md5,
+                                        validate_content,
                                         progress_callback,
                                         max_connections,
-                                        max_retries,
-                                        retry_wait,
                                         lease_id,
                                         if_modified_since,
                                         if_unmodified_since,
@@ -2037,23 +2289,22 @@ class BaseBlobService(StorageClient):
         _validate_not_none('blob_name', blob_name)
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path(container_name, blob_name)
-        request.query = [
-            ('snapshot', _to_str(snapshot)),
-            ('comp', 'metadata'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-lease-id', _to_str(lease_id)),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),
-            ('If-Match', _to_str(if_match)),
-            ('If-None-Match', _to_str(if_none_match)),
-        ]     
+        request.query = {
+            'snapshot': _to_str(snapshot),
+            'comp': 'metadata',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'x-ms-lease-id': _to_str(lease_id),
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),
+            'If-Match': _to_str(if_match),
+            'If-None-Match': _to_str(if_none_match),
+        }     
 
-        response = self._perform_request(request)
-        return _parse_metadata(response)
+        return self._perform_request(request, _parse_metadata)
 
     def set_blob_metadata(self, container_name, blob_name,
                           metadata=None, lease_id=None,
@@ -2104,23 +2355,22 @@ class BaseBlobService(StorageClient):
         _validate_not_none('blob_name', blob_name)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name, blob_name)
-        request.query = [
-            ('comp', 'metadata'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-meta-name-values', metadata),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),
-            ('If-Match', _to_str(if_match)),
-            ('If-None-Match', _to_str(if_none_match)),
-            ('x-ms-lease-id', _to_str(lease_id)),
-        ]
+        request.query = {
+            'comp': 'metadata',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),
+            'If-Match': _to_str(if_match),
+            'If-None-Match': _to_str(if_none_match),
+            'x-ms-lease-id': _to_str(lease_id),
+        }
+        _add_metadata_headers(metadata, request)
 
-        response = self._perform_request(request)
-        return _parse_base_properties(response)
+        return self._perform_request(request, _parse_base_properties)
 
     def _lease_blob_impl(self, container_name, blob_name,
                          lease_action, lease_id,
@@ -2128,8 +2378,15 @@ class BaseBlobService(StorageClient):
                          proposed_lease_id, if_modified_since,
                          if_unmodified_since, if_match, if_none_match, timeout=None):
         '''
-        Establishes and manages a lock on a blob for write and delete operations.
-        The lock duration can be 15 to 60 seconds, or can be infinite.
+        Establishes and manages a lease on a blob for write and delete operations.
+        The Lease Blob operation can be called in one of five modes:
+            Acquire, to request a new lease.
+            Renew, to renew an existing lease.
+            Change, to change the ID of an existing lease.
+            Release, to free the lease if it is no longer needed so that another
+                client may immediately acquire a lease against the blob.
+            Break, to end the lease but ensure that another client cannot acquire
+                a new lease until the current lease period has expired.
 
         :param str container_name:
             Name of existing container.
@@ -2190,25 +2447,25 @@ class BaseBlobService(StorageClient):
         _validate_not_none('lease_action', lease_action)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name, blob_name)
-        request.query = [
-            ('comp', 'lease'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-lease-id', _to_str(lease_id)),
-            ('x-ms-lease-action', _to_str(lease_action)),
-            ('x-ms-lease-duration', _to_str(lease_duration)),
-            ('x-ms-lease-break-period', _to_str(lease_break_period)),
-            ('x-ms-proposed-lease-id', _to_str(proposed_lease_id)),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),
-            ('If-Match', _to_str(if_match)),
-            ('If-None-Match', _to_str(if_none_match)),
-        ]
+        request.query = {
+            'comp': 'lease',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'x-ms-lease-id': _to_str(lease_id),
+            'x-ms-lease-action': _to_str(lease_action),
+            'x-ms-lease-duration': _to_str(lease_duration),
+            'x-ms-lease-break-period': _to_str(lease_break_period),
+            'x-ms-proposed-lease-id': _to_str(proposed_lease_id),
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),
+            'If-Match': _to_str(if_match),
+            'If-None-Match': _to_str(if_none_match),
+        }
 
-        return self._perform_request(request)
+        return self._perform_request(request, _parse_lease)
 
     def acquire_blob_lease(self, container_name, blob_name,
                            lease_duration=-1,
@@ -2218,9 +2475,9 @@ class BaseBlobService(StorageClient):
                            if_match=None,
                            if_none_match=None, timeout=None):
         '''
-        Acquires a lock on a blob for write and delete operations.
-        The lock duration can be 15 to 60 seconds, or can be infinite.
-
+        Requests a new lease. If the blob does not have an active lease, the Blob
+        service creates a lease on the blob and returns a new lease ID.
+        
         :param str container_name:
             Name of existing container.
         :param str blob_name:
@@ -2265,28 +2522,31 @@ class BaseBlobService(StorageClient):
         if lease_duration is not -1 and\
            (lease_duration < 15 or lease_duration > 60):
             raise ValueError(_ERROR_INVALID_LEASE_DURATION)
-        response = self._lease_blob_impl(container_name,
-                                     blob_name,
-                                     _LeaseActions.Acquire,
-                                     None, # lease_id
-                                     lease_duration,
-                                     None, # lease_break_period
-                                     proposed_lease_id,
-                                     if_modified_since,
-                                     if_unmodified_since,
-                                     if_match,
-                                     if_none_match,
-                                     timeout)
-        return _parse_lease_id(response)
+        lease = self._lease_blob_impl(container_name,
+                                      blob_name,
+                                      _LeaseActions.Acquire,
+                                      None, # lease_id
+                                      lease_duration,
+                                      None, # lease_break_period
+                                      proposed_lease_id,
+                                      if_modified_since,
+                                      if_unmodified_since,
+                                      if_match,
+                                      if_none_match,
+                                      timeout)
+        return lease['id']
 
     def renew_blob_lease(self, container_name, blob_name,
                          lease_id, if_modified_since=None,
                          if_unmodified_since=None, if_match=None,
                          if_none_match=None, timeout=None):
         '''
-        Renews a lock on a blob for write and delete operations.
-        The lock duration can be 15 to 60 seconds, or can be infinite.
-
+        Renews the lease. The lease can be renewed if the lease ID specified on
+        the request matches that associated with the blob. Note that the lease may
+        be renewed even if it has expired as long as the blob has not been modified
+        or leased again since the expiration of that lease. When you renew a lease,
+        the lease duration clock resets. 
+        
         :param str container_name:
             Name of existing container.
         :param str blob_name:
@@ -2321,28 +2581,29 @@ class BaseBlobService(StorageClient):
         '''
         _validate_not_none('lease_id', lease_id)
 
-        response = self._lease_blob_impl(container_name,
-                                            blob_name,
-                                            _LeaseActions.Renew,
-                                            lease_id,
-                                            None, # lease_duration
-                                            None, # lease_break_period
-                                            None, # proposed_lease_id
-                                            if_modified_since,
-                                            if_unmodified_since,
-                                            if_match,
-                                            if_none_match,
-                                            timeout)
-        return _parse_lease_id(response)
+        lease = self._lease_blob_impl(container_name,
+                                      blob_name,
+                                      _LeaseActions.Renew,
+                                      lease_id,
+                                      None, # lease_duration
+                                      None, # lease_break_period
+                                      None, # proposed_lease_id
+                                      if_modified_since,
+                                      if_unmodified_since,
+                                      if_match,
+                                      if_none_match,
+                                      timeout)
+        return lease['id']
 
     def release_blob_lease(self, container_name, blob_name,
                            lease_id, if_modified_since=None,
                            if_unmodified_since=None, if_match=None,
                            if_none_match=None, timeout=None):
         '''
-        Releases a lock on a blob for write and delete operations.
-        The lock duration can be 15 to 60 seconds, or can be infinite.
-
+        Releases the lease. The lease may be released if the lease ID specified on the
+        request matches that associated with the blob. Releasing the lease allows another
+        client to immediately acquire the lease for the blob as soon as the release is complete. 
+        
         :param str container_name:
             Name of existing container.
         :param str blob_name:
@@ -2395,8 +2656,15 @@ class BaseBlobService(StorageClient):
                          if_match=None,
                          if_none_match=None, timeout=None):
         '''
-        Breaks a lock on a blob for write and delete operations.
-        The lock duration can be 15 to 60 seconds, or can be infinite.
+        Breaks the lease, if the blob has an active lease. Once a lease is broken,
+        it cannot be renewed. Any authorized request can break the lease; the request
+        is not required to specify a matching lease ID. When a lease is broken,
+        the lease break period is allowed to elapse, during which time no lease operation
+        except break and release can be performed on the blob. When a lease is successfully
+        broken, the response indicates the interval in seconds until a new lease can be acquired. 
+
+        A lease that has been broken can also be released, in which case another client may
+        immediately acquire the lease on the blob.
 
         :param str container_name:
             Name of existing container.
@@ -2441,19 +2709,19 @@ class BaseBlobService(StorageClient):
         if (lease_break_period is not None) and (lease_break_period < 0 or lease_break_period > 60):
             raise ValueError(_ERROR_INVALID_LEASE_BREAK_PERIOD)
 
-        response = self._lease_blob_impl(container_name,
-                                     blob_name,
-                                     _LeaseActions.Break,
-                                     None, # lease_id
-                                     None, # lease_duration
-                                     lease_break_period,
-                                     None, # proposed_lease_id
-                                     if_modified_since,
-                                     if_unmodified_since,
-                                     if_match,
-                                     if_none_match,
-                                     timeout)
-        return _parse_lease_time(response)
+        lease = self._lease_blob_impl(container_name,
+                                      blob_name,
+                                      _LeaseActions.Break,
+                                      None, # lease_id
+                                      None, # lease_duration
+                                      lease_break_period,
+                                      None, # proposed_lease_id
+                                      if_modified_since,
+                                      if_unmodified_since,
+                                      if_match,
+                                      if_none_match,
+                                      timeout)
+        return lease['time']
 
     def change_blob_lease(self, container_name, blob_name,
                          lease_id,
@@ -2463,8 +2731,8 @@ class BaseBlobService(StorageClient):
                          if_match=None,
                          if_none_match=None, timeout=None):
         '''
-        Changes a lock on a blob for write and delete operations.
-        The lock duration can be 15 to 60 seconds, or can be infinite.
+        Changes the lease ID of an active lease. A change must include the current
+        lease ID and a new lease ID.
 
         :param str container_name:
             Name of existing container.
@@ -2562,23 +2830,22 @@ class BaseBlobService(StorageClient):
         _validate_not_none('blob_name', blob_name)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name, blob_name)
-        request.query = [
-            ('comp', 'snapshot'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-meta-name-values', metadata),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),
-            ('If-Match', _to_str(if_match)),
-            ('If-None-Match', _to_str(if_none_match)),
-            ('x-ms-lease-id', _to_str(lease_id))
-        ]
+        request.query = {
+            'comp': 'snapshot',
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),
+            'If-Match': _to_str(if_match),
+            'If-None-Match': _to_str(if_none_match),
+            'x-ms-lease-id': _to_str(lease_id)
+        }
+        _add_metadata_headers(metadata, request)
 
-        response = self._perform_request(request)
-        return _parse_snapshot_blob(blob_name, response)
+        return self._perform_request(request, _parse_snapshot_blob, [blob_name])
 
     def copy_blob(self, container_name, blob_name, copy_source,
                   metadata=None,
@@ -2592,23 +2859,55 @@ class BaseBlobService(StorageClient):
                   destination_lease_id=None,
                   source_lease_id=None, timeout=None):
         '''
-        Copies a blob to a destination within the storage account.
-        The source for a Copy Blob operation can be a committed blob 
-        or an Azure file in any Azure storage account.
+        Copies a blob asynchronously. This operation returns a copy operation 
+        properties object, including a copy ID you can use to check or abort the 
+        copy operation. The Blob service copies blobs on a best-effort basis.
+
+        The source blob for a copy operation may be a block blob, an append blob, 
+        or a page blob. If the destination blob already exists, it must be of the 
+        same blob type as the source blob. Any existing destination blob will be 
+        overwritten. The destination blob cannot be modified while a copy operation 
+        is in progress.
+
+        When copying from a page blob, the Blob service creates a destination page 
+        blob of the source blob’s length, initially containing all zeroes. Then 
+        the source page ranges are enumerated, and non-empty ranges are copied. 
+
+        For a block blob or an append blob, the Blob service creates a committed 
+        blob of zero length before returning from this operation. When copying 
+        from a block blob, all committed blocks and their block IDs are copied. 
+        Uncommitted blocks are not copied. At the end of the copy operation, the 
+        destination blob will have the same committed block count as the source.
+
+        When copying from an append blob, all committed blocks are copied. At the 
+        end of the copy operation, the destination blob will have the same committed 
+        block count as the source.
+
+        For all blob types, you can call get_blob_properties on the destination 
+        blob to check the status of the copy operation. The final blob will be 
+        committed when the copy completes.
 
         :param str container_name:
-            Name of existing container.
+            Name of the destination container. The container must exist.
         :param str blob_name:
-            Name of existing blob.
+            Name of the destination blob. If the destination blob exists, it will 
+            be overwritten. Otherwise, it will be created.
         :param str copy_source:
-            URL up to 2 KB in length that specifies a blob. A source blob in
-            the same account can be private, but a blob in another account
-            must be public or accept credentials included in this URL, such as
-            a Shared Access Signature. Examples:
+            A URL of up to 2 KB in length that specifies an Azure file or blob. 
+            The value should be URL-encoded as it would appear in a request URI. 
+            If the source is in another account, the source must either be public 
+            or must be authenticated via a shared access signature. If the source 
+            is public, no authentication is required.
+            Examples:
             https://myaccount.blob.core.windows.net/mycontainer/myblob
             https://myaccount.blob.core.windows.net/mycontainer/myblob?snapshot=<DateTime>
+            https://otheraccount.blob.core.windows.net/mycontainer/myblob?sastoken
         :param metadata:
-            Dict containing name and value pairs.
+            Name-value pairs associated with the blob as metadata. If no name-value 
+            pairs are specified, the operation will copy the metadata from the 
+            source blob or file to the destination blob. If one or more name-value 
+            pairs are specified, the destination blob is created with the specified 
+            metadata, and metadata is not copied from the source blob or file. 
         :type metadata: A dict mapping str to str.
         :param datetime source_if_modified_since:
             A DateTime value. Azure expects the date value passed in to be UTC.
@@ -2675,6 +2974,36 @@ class BaseBlobService(StorageClient):
         :return: Copy operation properties such as status, source, and ID.
         :rtype: :class:`~azure.storage.blob.models.CopyProperties`
         '''
+        return self._copy_blob(container_name, blob_name, copy_source,
+                          metadata,
+                          source_if_modified_since, source_if_unmodified_since,
+                          source_if_match, source_if_none_match,
+                          destination_if_modified_since,
+                          destination_if_unmodified_since,
+                          destination_if_match,
+                          destination_if_none_match,
+                          destination_lease_id,
+                          source_lease_id, timeout,
+                          False)
+
+    def _copy_blob(self, container_name, blob_name, copy_source,
+                  metadata=None,
+                  source_if_modified_since=None,
+                  source_if_unmodified_since=None,
+                  source_if_match=None, source_if_none_match=None,
+                  destination_if_modified_since=None,
+                  destination_if_unmodified_since=None,
+                  destination_if_match=None,
+                  destination_if_none_match=None,
+                  destination_lease_id=None,
+                  source_lease_id=None, timeout=None,
+                  incremental_copy=False):
+        '''
+        See copy_blob for more details. This helper method
+        allows for standard copies as well as incremental copies which are only supported for page blobs.
+        :param bool incremental_copy:
+            The timeout parameter is expressed in seconds.
+        '''
         _validate_not_none('container_name', container_name)
         _validate_not_none('blob_name', blob_name)
         _validate_not_none('copy_source', copy_source)
@@ -2697,30 +3026,33 @@ class BaseBlobService(StorageClient):
 
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name, blob_name)
-        request.query = [('timeout', _int_to_str(timeout))]
-        request.headers = [
-            ('x-ms-copy-source', _to_str(copy_source)),
-            ('x-ms-meta-name-values', metadata),
-            ('x-ms-source-if-modified-since',
-             _to_str(source_if_modified_since)),
-            ('x-ms-source-if-unmodified-since',
-             _to_str(source_if_unmodified_since)),
-            ('x-ms-source-if-match', _to_str(source_if_match)),
-            ('x-ms-source-if-none-match',
-             _to_str(source_if_none_match)),
-            ('If-Modified-Since', _datetime_to_utc_string(destination_if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(destination_if_unmodified_since)),
-            ('If-Match', _to_str(destination_if_match)),
-            ('If-None-Match', _to_str(destination_if_none_match)),
-            ('x-ms-lease-id', _to_str(destination_lease_id)),
-            ('x-ms-source-lease-id', _to_str(source_lease_id))
-        ]
 
-        response = self._perform_request(request)
-        props = _parse_properties(response, BlobProperties)
-        return props.copy
+        if incremental_copy:
+            request.query = {
+                'comp': 'incrementalcopy',
+                'timeout': _int_to_str(timeout),
+            }
+        else:
+            request.query = {'timeout': _int_to_str(timeout)}
+
+        request.headers = {
+            'x-ms-copy-source': _to_str(copy_source),
+            'x-ms-source-if-modified-since': _to_str(source_if_modified_since),
+            'x-ms-source-if-unmodified-since': _to_str(source_if_unmodified_since),
+            'x-ms-source-if-match': _to_str(source_if_match),
+            'x-ms-source-if-none-match': _to_str(source_if_none_match),
+            'If-Modified-Since': _datetime_to_utc_string(destination_if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(destination_if_unmodified_since),
+            'If-Match': _to_str(destination_if_match),
+            'If-None-Match': _to_str(destination_if_none_match),
+            'x-ms-lease-id': _to_str(destination_lease_id),
+            'x-ms-source-lease-id': _to_str(source_lease_id)
+        }
+        _add_metadata_headers(metadata, request)
+
+        return self._perform_request(request, _parse_properties, [BlobProperties]).copy
 
     def abort_copy_blob(self, container_name, blob_name, copy_id,
                         lease_id=None, timeout=None):
@@ -2745,17 +3077,17 @@ class BaseBlobService(StorageClient):
         _validate_not_none('copy_id', copy_id)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name, blob_name)
-        request.query = [
-            ('comp', 'copy'),
-            ('copyid', _to_str(copy_id)),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [
-            ('x-ms-lease-id', _to_str(lease_id)),
-            ('x-ms-copy-action', 'abort'),
-        ]
+        request.query = {
+            'comp': 'copy',
+            'copyid': _to_str(copy_id),
+            'timeout': _int_to_str(timeout),
+        }
+        request.headers = {
+            'x-ms-lease-id': _to_str(lease_id),
+            'x-ms-copy-action': 'abort',
+        }
 
         self._perform_request(request)
 
@@ -2812,19 +3144,19 @@ class BaseBlobService(StorageClient):
         _validate_not_none('blob_name', blob_name)
         request = HTTPRequest()
         request.method = 'DELETE'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(container_name, blob_name)
-        request.headers = [
-            ('x-ms-lease-id', _to_str(lease_id)),
-            ('x-ms-delete-snapshots', _to_str(delete_snapshots)),
-            ('If-Modified-Since', _datetime_to_utc_string(if_modified_since)),
-            ('If-Unmodified-Since', _datetime_to_utc_string(if_unmodified_since)),
-            ('If-Match', _to_str(if_match)),
-            ('If-None-Match', _to_str(if_none_match)),
-        ]
-        request.query = [
-            ('snapshot', _to_str(snapshot)),
-            ('timeout', _int_to_str(timeout))
-        ]
+        request.headers = {
+            'x-ms-lease-id': _to_str(lease_id),
+            'x-ms-delete-snapshots': _to_str(delete_snapshots),
+            'If-Modified-Since': _datetime_to_utc_string(if_modified_since),
+            'If-Unmodified-Since': _datetime_to_utc_string(if_unmodified_since),
+            'If-Match': _to_str(if_match),
+            'If-None-Match': _to_str(if_none_match),
+        }
+        request.query = {
+            'snapshot': _to_str(snapshot),
+            'timeout': _int_to_str(timeout)
+        }
 
         self._perform_request(request)

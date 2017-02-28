@@ -54,6 +54,7 @@ class ContainerProperties(object):
         self.last_modified = None
         self.etag = None
         self.lease = LeaseProperties()
+        self.public_access = None
 
 
 class Blob(object):
@@ -96,17 +97,24 @@ class BlobProperties(object):
         The ETag contains a value that you can use to perform operations
         conditionally.
     :ivar int content_length:
-        Length of blob in bytes.
+        The length of the content returned. If the entire blob was requested, 
+        the length of blob in bytes. If a subset of the blob was requested, the 
+        length of the returned subset.
+    :ivar str content_range:
+        Indicates the range of bytes returned in the event that the client 
+        requested a subset of the blob.
     :ivar int append_blob_committed_block_count:
         (For Append Blobs) Number of committed blocks in the blob.
     :ivar int page_blob_sequence_number:
         (For Page Blobs) Sequence number for page blob used for coordinating
         concurrent writes.
+    :ivar bool server_encrypted:
+        Set to true if the blob is encrypted on the server.
     :ivar ~azure.storage.blob.models.CopyProperties copy:
         Stores all the copy properties for the blob.
     :ivar ~azure.storage.blob.models.ContentSettings content_settings:
         Stores all the content settings for the blob.
-    :ivar LeaseProperties lease:
+    :ivar ~azure.storage.blob.models.LeaseProperties lease:
         Stores all the lease information for the blob.
     '''
 
@@ -115,8 +123,10 @@ class BlobProperties(object):
         self.last_modified = None
         self.etag = None
         self.content_length = None
+        self.content_range = None
         self.append_blob_committed_block_count = None
         self.page_blob_sequence_number = None
+        self.server_encrypted = None
         self.copy = CopyProperties()
         self.content_settings = ContentSettings()
         self.lease = LeaseProperties()
@@ -163,17 +173,14 @@ class ContentSettings(object):
         self.content_md5 = content_md5
 
     def _to_headers(self):
-        return [
-            ('x-ms-blob-cache-control', _to_str(self.cache_control)),
-            ('x-ms-blob-content-type', _to_str(self.content_type)),
-            ('x-ms-blob-content-disposition',
-                _to_str(self.content_disposition)),
-            ('x-ms-blob-content-md5', _to_str(self.content_md5)),
-            ('x-ms-blob-content-encoding',
-                _to_str(self.content_encoding)),
-            ('x-ms-blob-content-language',
-                _to_str(self.content_language)),
-        ]
+        return {
+            'x-ms-blob-cache-control': _to_str(self.cache_control),
+            'x-ms-blob-content-type': _to_str(self.content_type),
+            'x-ms-blob-content-disposition': _to_str(self.content_disposition),
+            'x-ms-blob-content-md5': _to_str(self.content_md5),
+            'x-ms-blob-content-encoding': _to_str(self.content_encoding),
+            'x-ms-blob-content-language': _to_str(self.content_language),
+        }
 
 
 class CopyProperties(object):
@@ -319,11 +326,15 @@ class PageRange(object):
         Start of page range in bytes.
     :ivar int end:
         End of page range in bytes.
+    :ivar bool is_cleared:
+        Indicates if a page range is cleared or not. Only applicable
+        for get_page_range_diff API.
     '''
 
-    def __init__(self, start=None, end=None):
+    def __init__(self, start=None, end=None, is_cleared=False):
         self.start = start
         self.end = end
+        self.is_cleared = is_cleared
 
 class ResourceProperties(object):
 
@@ -375,6 +386,12 @@ class PageBlobProperties(ResourceProperties):
 class PublicAccess(object):
     '''
     Specifies whether data in the container may be accessed publicly and the level of access.
+    '''
+
+    OFF = 'off'
+    '''
+    Specifies that there is no public read access for both the container and blobs within the container.
+    Clients cannot enumerate the containers within the storage account as well as the blobs within the container.
     '''
 
     Blob = 'blob'

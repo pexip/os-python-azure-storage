@@ -27,8 +27,10 @@ from ..models import (
 )
 from .._deserialization import (
     _int_to_str,
-    _parse_response_for_dict,
     _parse_metadata,
+)
+from ._encryption import (
+    _decrypt_queue_message,
 )
 
 def _parse_metadata_and_message_count(response):
@@ -36,9 +38,7 @@ def _parse_metadata_and_message_count(response):
     Extracts approximate messages count header.
     '''
     metadata = _parse_metadata(response)
-
-    headers = _parse_response_for_dict(response)
-    metadata.approximate_message_count = _int_to_str(headers.get('x-ms-approximate-messages-count'))
+    metadata.approximate_message_count = _int_to_str(response.headers.get('x-ms-approximate-messages-count'))
 
     return metadata
 
@@ -46,11 +46,9 @@ def _parse_queue_message_from_headers(response):
     '''
     Extracts pop receipt and time next visible from headers.
     '''
-    headers = _parse_response_for_dict(response)
-
     message = QueueMessage()
-    message.pop_receipt = headers.get('x-ms-popreceipt')
-    message.time_next_visible = parser.parse(headers.get('x-ms-time-next-visible'))
+    message.pop_receipt = response.headers.get('x-ms-popreceipt')
+    message.time_next_visible = parser.parse(response.headers.get('x-ms-time-next-visible'))
     
     return message
 
@@ -72,7 +70,7 @@ def _convert_xml_to_queues(response):
     </EnumerationResults>
     '''
     if response is None or response.body is None:
-        return response
+        return None
 
     queues = _list()
     list_element = ETree.fromstring(response.body)
@@ -100,7 +98,7 @@ def _convert_xml_to_queues(response):
 
     return queues
 
-def _convert_xml_to_queue_messages(response, decode_function):
+def _convert_xml_to_queue_messages(response, decode_function, require_encryption, key_encryption_key, resolver, content=None):
     '''
     <?xml version="1.0" encoding="utf-8"?>
     <QueueMessagesList>
@@ -116,7 +114,7 @@ def _convert_xml_to_queue_messages(response, decode_function):
     </QueueMessagesList>
     '''
     if response is None or response.body is None:
-        return response
+        return None
 
     messages = list()
     list_element = ETree.fromstring(response.body)
@@ -125,9 +123,20 @@ def _convert_xml_to_queue_messages(response, decode_function):
         message = QueueMessage()
 
         message.id = message_element.findtext('MessageId')
-        message.dequeue_count = message_element.findtext('DequeueCount')
 
-        message.content = decode_function(message_element.findtext('MessageText'))
+        dequeue_count = message_element.findtext('DequeueCount')
+        if dequeue_count is not None:
+            message.dequeue_count = _int_to_str(dequeue_count)
+
+        # content is not returned for put_message
+        if content is not None:
+            message.content = content
+        else:
+            message.content = message_element.findtext('MessageText')
+            if (key_encryption_key is not None) or (resolver is not None):
+                message.content = _decrypt_queue_message(message.content, require_encryption,
+                                                            key_encryption_key, resolver)
+            message.content = decode_function(message.content)
 
         message.insertion_time = parser.parse(message_element.findtext('InsertionTime'))
         message.expiration_time = parser.parse(message_element.findtext('ExpirationTime'))
