@@ -1,3 +1,9 @@
+python-azure-storage (0.34.0-1) pexip; urgency=low
+
+  * New upstream release
+
+ -- John-Mark Bell <jmb@pexip.com>  Tue, 28 Feb 2017 01:37:33 +0000
+
 python-azure-storage (0.30.0-2) pexip; urgency=low
 
   * No-change rebuild
