@@ -26,9 +26,13 @@ from .._error import (
     _validate_not_none,
     _ERROR_CONFLICT,
     _ERROR_STORAGE_MISSING_INFO,
+    _validate_access_policies,
+    _validate_encryption_required,
+    _validate_decryption_required,
 )
 from .._serialization import (
     _get_request_body,
+    _add_metadata_headers,
 )
 from .._common_conversion import (
     _int_to_str,
@@ -40,6 +44,7 @@ from .._http import (
 from ..models import (
     Services,
     ListGenerator,
+    _OperationContext,
 )
 from .models import (
     QueueMessageFormat,
@@ -56,6 +61,7 @@ from .._serialization import (
 from .._deserialization import (
     _convert_xml_to_service_properties,
     _convert_xml_to_signed_identifiers,
+    _convert_xml_to_service_stats,
 )
 from ._serialization import (
     _convert_queue_message_xml,
@@ -101,6 +107,27 @@ class QueueService(StorageClient):
         for developing across multiple Azure Storage libraries in different languages. 
         See the :class:`~azure.storage.queue.models.QueueMessageFormat` for xml, base64 
         and no decoding methods as well as binary equivalents.
+    :ivar object key_encryption_key:
+        The key-encryption-key optionally provided by the user. If provided, will be used to
+        encrypt/decrypt in supported methods.
+        For methods requiring decryption, either the key_encryption_key OR the resolver must be provided.
+        If both are provided, the resolver will take precedence.
+        Must implement the following methods for APIs requiring encryption:
+        wrap_key(key)--wraps the specified key (bytes) using an algorithm of the user's choice. Returns the encrypted key as bytes.
+        get_key_wrap_algorithm()--returns the algorithm used to wrap the specified symmetric key.
+        get_kid()--returns a string key id for this key-encryption-key.
+        Must implement the following methods for APIs requiring decryption:
+        unwrap_key(key, algorithm)--returns the unwrapped form of the specified symmetric key using the string-specified algorithm.
+        get_kid()--returns a string key id for this key-encryption-key.
+    :ivar function key_resolver_function(kid):
+        A function to resolve keys optionally provided by the user. If provided, will be used to decrypt in supported methods.
+        For methods requiring decryption, either the key_encryption_key OR
+        the resolver must be provided. If both are provided, the resolver will take precedence.
+        It uses the kid string to return a key-encryption-key implementing the interface defined above.
+    :ivar bool require_encryption:
+        A flag that may be set to ensure that all messages successfully uploaded to the queue and all those downloaded and
+        successfully read from the queue are/were encrypted while on the server. If this flag is set, all required 
+        parameters for encryption/decryption must be provided. See the above comments on the key_encryption_key and resolver.
     '''
 
     def __init__(self, account_name=None, account_key=None, sas_token=None, 
@@ -160,6 +187,9 @@ class QueueService(StorageClient):
 
         self.encode_function = QueueMessageFormat.text_xmlencode
         self.decode_function = QueueMessageFormat.text_xmldecode
+        self.key_encryption_key = None
+        self.key_resolver_function = None
+        self.require_encryption = False
 
     def generate_account_shared_access_signature(self, resource_types, permission, 
                                         expiry, start=None, ip=None, protocol=None):
@@ -244,8 +274,7 @@ class QueueService(StorageClient):
         :type start: date or str
         :param str id:
             A unique value up to 64 characters in length that correlates to a 
-            stored access policy. To create a stored access policy, use 
-            set_blob_service_properties.
+            stored access policy. To create a stored access policy, use :func:`~set_queue_acl`.
         :param str ip:
             Specifies an IP address or a range of IP addresses from which to accept requests.
             If the IP address from which the request originates does not match the IP address
@@ -273,6 +302,42 @@ class QueueService(StorageClient):
             protocol=protocol,
         )
 
+    def get_queue_service_stats(self, timeout=None):
+        '''
+        Retrieves statistics related to replication for the Queue service. It is 
+        only available when read-access geo-redundant replication is enabled for 
+        the storage account.
+
+        With geo-redundant replication, Azure Storage maintains your data durable 
+        in two locations. In both locations, Azure Storage constantly maintains 
+        multiple healthy replicas of your data. The location where you read, 
+        create, update, or delete data is the primary storage account location. 
+        The primary location exists in the region you choose at the time you 
+        create an account via the Azure Management Azure classic portal, for 
+        example, North Central US. The location to which your data is replicated 
+        is the secondary location. The secondary location is automatically 
+        determined based on the location of the primary; it is in a second data 
+        center that resides in the same region as the primary location. Read-only 
+        access is available from the secondary location, if read-access geo-redundant 
+        replication is enabled for your storage account.
+
+        :param int timeout:
+            The timeout parameter is expressed in seconds.
+        :return: The queue service stats.
+        :rtype: :class:`~azure.storage.models.ServiceStats`
+        '''
+        request = HTTPRequest()
+        request.method = 'GET'
+        request.host_locations = self._get_host_locations(primary=False, secondary=True)
+        request.path = _get_path()
+        request.query = {
+            'restype': 'service',
+            'comp': 'stats',
+            'timeout': _int_to_str(timeout),
+        }
+
+        return self._perform_request(request, _convert_xml_to_service_stats)
+
     def get_queue_service_properties(self, timeout=None):
         '''
         Gets the properties of a storage account's Queue service, including
@@ -285,16 +350,15 @@ class QueueService(StorageClient):
         '''
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path()
-        request.query = [
-            ('restype', 'service'),
-            ('comp', 'properties'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        response = self._perform_request(request)
+        request.query = {
+            'restype': 'service',
+            'comp': 'properties',
+            'timeout': _int_to_str(timeout),
+        }
 
-        return _convert_xml_to_service_properties(response.body)
+        return self._perform_request(request, _convert_xml_to_service_properties)
 
     def set_queue_service_properties(self, logging=None, hour_metrics=None, 
                                     minute_metrics=None, cors=None, timeout=None):
@@ -309,10 +373,10 @@ class QueueService(StorageClient):
             The logging settings provide request logs.
         :param Metrics hour_metrics:
             The hour metrics settings provide a summary of request 
-            statistics grouped by API in hourly aggregates for blobs.
+            statistics grouped by API in hourly aggregates for queuess.
         :param Metrics minute_metrics:
             The minute metrics settings provide request statistics 
-            for each minute for blobs.
+            for each minute for queues.
         :param cors:
             You can include up to five CorsRule elements in the 
             list. If an empty list is specified, all CORS rules will be deleted, 
@@ -325,13 +389,13 @@ class QueueService(StorageClient):
         '''
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path()
-        request.query = [
-            ('restype', 'service'),
-            ('comp', 'properties'),
-            ('timeout', _int_to_str(timeout)),
-        ]
+        request.query = {
+            'restype': 'service',
+            'comp': 'properties',
+            'timeout': _int_to_str(timeout),
+        }
         request.body = _get_request_body(
             _convert_service_properties_to_xml(logging, hour_metrics, minute_metrics, cors))
         self._perform_request(request)
@@ -367,14 +431,15 @@ class QueueService(StorageClient):
             applied to each individual call.
         '''
         include = 'metadata' if include_metadata else None
+        operation_context = _OperationContext(location_lock=True)
         kwargs = {'prefix': prefix, 'max_results': num_results, 'include': include, 
-                  'marker': marker, 'timeout': timeout}
+                  'marker': marker, 'timeout': timeout, '_context': operation_context}
         resp = self._list_queues(**kwargs)
 
         return ListGenerator(resp, self._list_queues, (), kwargs)
 
     def _list_queues(self, prefix=None, marker=None, max_results=None,
-                    include=None, timeout=None):
+                    include=None, timeout=None, _context=None):
         '''
         Returns a list of queues under the specified account. Makes a single list 
         request to the service. Used internally by the list_queues method.
@@ -401,19 +466,18 @@ class QueueService(StorageClient):
         '''
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path()
-        request.query = [
-            ('comp', 'list'),
-            ('prefix', _to_str(prefix)),
-            ('marker', _to_str(marker)),
-            ('maxresults', _int_to_str(max_results)),
-            ('include', _to_str(include)),
-            ('timeout', _int_to_str(timeout))
-        ]
-        response = self._perform_request(request)
+        request.query = {
+            'comp': 'list',
+            'prefix': _to_str(prefix),
+            'marker': _to_str(marker),
+            'maxresults': _int_to_str(max_results),
+            'include': _to_str(include),
+            'timeout': _int_to_str(timeout)
+        }
 
-        return _convert_xml_to_queues(response)
+        return self._perform_request(request, _convert_xml_to_queues, operation_context=_context)
 
     def create_queue(self, queue_name, metadata=None, fail_on_exist=False, timeout=None):
         '''
@@ -443,13 +507,17 @@ class QueueService(StorageClient):
         _validate_not_none('queue_name', queue_name)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(queue_name)
-        request.query = [('timeout', _int_to_str(timeout))]
-        request.headers = [('x-ms-meta-name-values', metadata)]
+        request.query = {'timeout': _int_to_str(timeout)}
+        _add_metadata_headers(metadata, request)
+
+        def _return_request(request):
+            return request
+
         if not fail_on_exist:
             try:
-                response = self._perform_request(request)
+                response = self._perform_request(request, parser=_return_request)
                 if response.status == _HTTP_RESPONSE_NO_CONTENT:
                     return False
                 return True
@@ -457,7 +525,7 @@ class QueueService(StorageClient):
                 _dont_fail_on_exist(ex)
                 return False
         else:
-            response = self._perform_request(request)
+            response = self._perform_request(request, parser=_return_request)
             if response.status == _HTTP_RESPONSE_NO_CONTENT:
                 raise AzureConflictHttpError(
                     _ERROR_CONFLICT.format(response.message), response.status)
@@ -489,9 +557,9 @@ class QueueService(StorageClient):
         _validate_not_none('queue_name', queue_name)
         request = HTTPRequest()
         request.method = 'DELETE'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(queue_name)
-        request.query = [('timeout', _int_to_str(timeout))]
+        request.query = {'timeout': _int_to_str(timeout)}
         if not fail_not_exist:
             try:
                 self._perform_request(request)
@@ -521,15 +589,14 @@ class QueueService(StorageClient):
         _validate_not_none('queue_name', queue_name)
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path(queue_name)
-        request.query = [
-            ('comp', 'metadata'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        response = self._perform_request(request)
+        request.query = {
+            'comp': 'metadata',
+            'timeout': _int_to_str(timeout),
+        }
 
-        return _parse_metadata_and_message_count(response)
+        return self._perform_request(request, _parse_metadata_and_message_count)
 
     def set_queue_metadata(self, queue_name, metadata=None, timeout=None):
         '''
@@ -547,13 +614,14 @@ class QueueService(StorageClient):
         _validate_not_none('queue_name', queue_name)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(queue_name)
-        request.query = [
-            ('comp', 'metadata'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        request.headers = [('x-ms-meta-name-values', metadata)]
+        request.query = {
+            'comp': 'metadata',
+            'timeout': _int_to_str(timeout),
+        }
+        _add_metadata_headers(metadata, request)
+
         self._perform_request(request)
 
     def exists(self, queue_name, timeout=None):
@@ -589,15 +657,14 @@ class QueueService(StorageClient):
         _validate_not_none('queue_name', queue_name)
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path(queue_name)
-        request.query = [
-            ('comp', 'acl'),
-            ('timeout', _int_to_str(timeout)),
-        ]
-        response = self._perform_request(request)
+        request.query = {
+            'comp': 'acl',
+            'timeout': _int_to_str(timeout),
+        }
 
-        return _convert_xml_to_signed_identifiers(response.body)
+        return self._perform_request(request, _convert_xml_to_signed_identifiers)
 
     def set_queue_acl(self, queue_name, signed_identifiers=None, timeout=None):
         '''
@@ -626,14 +693,15 @@ class QueueService(StorageClient):
             The server timeout, expressed in seconds.
         '''
         _validate_not_none('queue_name', queue_name)
+        _validate_access_policies(signed_identifiers)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(queue_name)
-        request.query = [
-            ('comp', 'acl'),
-            ('timeout', _int_to_str(timeout)),
-        ]
+        request.query = {
+            'comp': 'acl',
+            'timeout': _int_to_str(timeout),
+        }
         request.body = _get_request_body(
             _convert_signed_identifiers_to_xml(signed_identifiers))
         self._perform_request(request)
@@ -650,6 +718,9 @@ class QueueService(StorageClient):
         The message time-to-live specifies how long a message will remain in the 
         queue. The message will be deleted from the queue when the time-to-live 
         period expires.
+
+        If the key-encryption-key field is set on the local service object, this method will
+        encrypt the content before uploading.
 
         :param str queue_name:
             The name of the queue to put the message into.
@@ -670,20 +741,34 @@ class QueueService(StorageClient):
             parameter is omitted, the default time-to-live is 7 days.
         :param int timeout:
             The server timeout, expressed in seconds.
+        :return:
+            A :class:`~azure.storage.queue.models.QueueMessage` object.
+            This object is also populated with the content although it is not
+            returned from the service.
+        :rtype: :class:`~azure.storage.queue.models.QueueMessage`
         '''
+
+        _validate_encryption_required(self.require_encryption, self.key_encryption_key)
+
         _validate_not_none('queue_name', queue_name)
         _validate_not_none('content', content)
         request = HTTPRequest()
         request.method = 'POST'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(queue_name, True)
-        request.query = [
-            ('visibilitytimeout', _to_str(visibility_timeout)),
-            ('messagettl', _to_str(time_to_live)),
-            ('timeout', _int_to_str(timeout))
-        ]
-        request.body = _get_request_body(_convert_queue_message_xml(content, self.encode_function))
-        self._perform_request(request)
+        request.query = {
+            'visibilitytimeout': _to_str(visibility_timeout),
+            'messagettl': _to_str(time_to_live),
+            'timeout': _int_to_str(timeout)
+        }
+
+        request.body = _get_request_body(_convert_queue_message_xml(content, self.encode_function,
+                                                                    self.key_encryption_key))
+
+        message_list = self._perform_request(request, _convert_xml_to_queue_messages,
+                                     [self.decode_function, False,
+                                      None, None, content])
+        return message_list[0]
 
     def get_messages(self, queue_name, num_messages=None,
                      visibility_timeout=None, timeout=None):
@@ -695,6 +780,9 @@ class QueueService(StorageClient):
         The message is not automatically deleted from the queue, but after it has 
         been retrieved, it is not visible to other clients for the time interval 
         specified by the visibility_timeout parameter.
+
+        If the key-encryption-key or resolver field is set on the local service object, the messages will be
+        decrypted before being returned.
 
         :param str queue_name:
             The name of the queue to get messages from.
@@ -710,22 +798,26 @@ class QueueService(StorageClient):
             a message can be set to a value later than the expiry time.
         :param int timeout:
             The server timeout, expressed in seconds.
-        :return: A list of :class:`~azure.storage.queue.models.QueueMessage` objects.
+        :return: A :class:`~azure.storage.queue.models.QueueMessage` object representing the information passed.
         :rtype: list of :class:`~azure.storage.queue.models.QueueMessage`
         '''
+        _validate_decryption_required(self.require_encryption, self.key_encryption_key,
+                                      self.key_resolver_function)
+
         _validate_not_none('queue_name', queue_name)
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(queue_name, True)
-        request.query = [
-            ('numofmessages', _to_str(num_messages)),
-            ('visibilitytimeout', _to_str(visibility_timeout)),
-            ('timeout', _int_to_str(timeout))
-        ]
-        response = self._perform_request(request)
+        request.query = {
+            'numofmessages': _to_str(num_messages),
+            'visibilitytimeout': _to_str(visibility_timeout),
+            'timeout': _int_to_str(timeout)
+        }
 
-        return _convert_xml_to_queue_messages(response, self.decode_function)
+        return self._perform_request(request, _convert_xml_to_queue_messages,
+                                     [self.decode_function, self.require_encryption,
+                                      self.key_encryption_key, self.key_resolver_function])
 
     def peek_messages(self, queue_name, num_messages=None, timeout=None):
         '''
@@ -739,6 +831,9 @@ class QueueService(StorageClient):
         determine how many times a message has been retrieved. Note that a call 
         to peek_messages does not increment the value of DequeueCount, but returns 
         this value for the client to read.
+
+        If the key-encryption-key or resolver field is set on the local service object, the messages will be
+        decrypted before being returned.
 
         :param str queue_name:
             The name of the queue to peek messages from.
@@ -754,18 +849,24 @@ class QueueService(StorageClient):
             not pop the message and can only retrieve already visible messages.
         :rtype: list of :class:`~azure.storage.queue.models.QueueMessage`
         '''
+
+        _validate_decryption_required(self.require_encryption, self.key_encryption_key,
+                                      self.key_resolver_function)
+
         _validate_not_none('queue_name', queue_name)
         request = HTTPRequest()
         request.method = 'GET'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations(secondary=True)
         request.path = _get_path(queue_name, True)
-        request.query = [
-            ('peekonly', 'true'),
-            ('numofmessages', _to_str(num_messages)),
-            ('timeout', _int_to_str(timeout))]
-        response = self._perform_request(request)
+        request.query = {
+            'peekonly': 'true',
+            'numofmessages': _to_str(num_messages),
+            'timeout': _int_to_str(timeout)
+        }
 
-        return _convert_xml_to_queue_messages(response, self.decode_function)
+        return self._perform_request(request, _convert_xml_to_queue_messages,
+                                     [self.decode_function, self.require_encryption,
+                                      self.key_encryption_key, self.key_resolver_function])
 
     def delete_message(self, queue_name, message_id, pop_receipt, timeout=None):
         '''
@@ -796,11 +897,12 @@ class QueueService(StorageClient):
         _validate_not_none('pop_receipt', pop_receipt)
         request = HTTPRequest()
         request.method = 'DELETE'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(queue_name, True, message_id)
-        request.query = [
-            ('popreceipt', _to_str(pop_receipt)),
-            ('timeout', _int_to_str(timeout))]
+        request.query = {
+            'popreceipt': _to_str(pop_receipt),
+            'timeout': _int_to_str(timeout)
+        }
         self._perform_request(request)
 
     def clear_messages(self, queue_name, timeout=None):
@@ -815,9 +917,9 @@ class QueueService(StorageClient):
         _validate_not_none('queue_name', queue_name)
         request = HTTPRequest()
         request.method = 'DELETE'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(queue_name, True)
-        request.query = [('timeout', _int_to_str(timeout))]
+        request.query = {'timeout': _int_to_str(timeout)}
         self._perform_request(request)
 
     def update_message(self, queue_name, message_id, pop_receipt, visibility_timeout, 
@@ -833,6 +935,9 @@ class QueueService(StorageClient):
         continually extend the message’s invisibility until it is processed. If 
         the worker role were to fail during processing, eventually the message 
         would become visible again and another worker role could process it.
+
+        If the key-encryption-key field is set on the local service object, this method will
+        encrypt the content before uploading.
 
         :param str queue_name:
             The name of the queue containing the message to update.
@@ -853,26 +958,29 @@ class QueueService(StorageClient):
         :param int timeout:
             The server timeout, expressed in seconds.
         :return: 
-            A list of :class:`~azure.storage.queue.models.QueueMessage` objects. Note that 
-            only time_next_visible and pop_receipt will be populated.
+            A list of :class:`~azure.storage.queue.models.QueueMessage` objects. For convenience,
+            this object is also populated with the content, although it is not returned by the service.
         :rtype: list of :class:`~azure.storage.queue.models.QueueMessage`
         '''
+
+        _validate_encryption_required(self.require_encryption, self.key_encryption_key)
+
         _validate_not_none('queue_name', queue_name)
         _validate_not_none('message_id', message_id)
         _validate_not_none('pop_receipt', pop_receipt)
         _validate_not_none('visibility_timeout', visibility_timeout)
         request = HTTPRequest()
         request.method = 'PUT'
-        request.host = self._get_host()
+        request.host_locations = self._get_host_locations()
         request.path = _get_path(queue_name, True, message_id)
-        request.query = [
-            ('popreceipt', _to_str(pop_receipt)),
-            ('visibilitytimeout', _int_to_str(visibility_timeout)),
-            ('timeout', _int_to_str(timeout))
-        ]
+        request.query = {
+            'popreceipt': _to_str(pop_receipt),
+            'visibilitytimeout': _int_to_str(visibility_timeout),
+            'timeout': _int_to_str(timeout)
+        }
 
         if content is not None:
-            request.body = _get_request_body(_convert_queue_message_xml(content, self.encode_function))
+            request.body = _get_request_body(_convert_queue_message_xml(content, self.encode_function,
+                                                                        self.key_encryption_key))
 
-        response = self._perform_request(request)
-        return _parse_queue_message_from_headers(response)
+        return self._perform_request(request, _parse_queue_message_from_headers)
